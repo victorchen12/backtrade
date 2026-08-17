@@ -1,0 +1,65 @@
+paths:
+  project_root: /home/cws/QUANT/Backtrade
+  output_root: /data1/cws/backtrade/campaigns/compact-v9-ofi-single-day/taker
+  future_l2_data_root: /data1/cws/future_l2/dataset
+
+data:
+  source: future_l2
+  product: ag
+  split_id: '000'
+  factor_path: /data1/cws/backtrade/baselines/ofi_cks_best_level_5s_20260805/ofi_factor_values_keyed.parquet
+  market_path: /data1/cws/future_l2/dataset/status_divide_data2/ag/raw_complete_24_26_v1/continuous_main_tick/ag_con_tick_24_26.parquet
+  parts: [test]
+  trading_days: ['2026-01-05']
+  factor_grid_mode: decision_grid
+  eof_is_day_end: true
+
+strategy:
+  factor_name: ofi_cks_best_level_5s
+  factor_column: ofi_cks_best_level_5s
+
+execution:
+  latency_ms: 5
+  day_end_flatten_window_ms: 5000
+
+match:
+  mode: taker
+
+limit_reference:
+  mode: prev_day_vwap_proxy
+  snapshot_path: /data1/cws/backtrade/price_limits/v2p3_24_26_20260804/price_limit_references.parquet
+  shfe_new_rule_effective_date: 2026-05-28
+
+risk:
+  max_daily_loss: 1000000
+  max_holding_ms: 86400000
+  stop_on_capital_depleted: true
+  capital_floor: 0
+
+initial_cash: 1000000
+
+contracts:
+  ag:
+    code: AG
+    exchange: SHFE
+    multiplier: 15.0
+    tick_size: 1.0
+    tick_value: 15.0
+    fee:
+      open:
+        mode: rate
+        value: 0.00005
+      close:
+        mode: rate
+        value: 0.00005
+      close_today:
+        mode: rate
+        value: 0.00005
+        contract_overrides:
+          AG2602: 0.00025
+          AG2604: 0.00005
+    price_limit:
+      mode: percent
+      value: 0.20
+      contract_overrides:
+        AG2601: 0.16

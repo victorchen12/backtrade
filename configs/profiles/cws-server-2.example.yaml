@@ -1,0 +1,6 @@
+# Copy to configs/profiles/cws-server-2.yaml for the shared server.
+# The copied local profile is ignored by Git.
+paths:
+  project_root: /home/cws/QUANT/Backtrade
+  output_root: /data1/cws/backtrade
+  future_l2_data_root: /data1/cws/future_l2/dataset

@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "backtrade"
+version = "0.2.0"
+description = "Deterministic futures L2 backtest simulator."
+requires-python = ">=3.11"
+dependencies = [
+  "pydantic>=2,<3",
+  "PyYAML>=6",
+  "pandas>=2",
+  "pyarrow>=14",
+]
+
+[project.scripts]
+backtrade = "backtrade.cli:main"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<9",
+  "ruff>=0.6,<1",
+]
+
+[tool.setuptools.packages.find]
+include = ["backtrade*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_compact_v9_*.py"]
+pythonpath = ["."]
+addopts = ["--import-mode=importlib"]
