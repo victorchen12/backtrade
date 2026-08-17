@@ -210,13 +210,27 @@ def read_compact_v9(output_root: str | Path) -> dict[str, Any]:
         raise ValueError("compact_v9 requires single_lot=true, position_limit=1, margin_enabled=false")
     config = manifest.get("config")
     digest = manifest.get("config_digest")
-    if config is not None:
-        encoded = json.dumps(config, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode()
-        if digest != hashlib.sha256(encoded).hexdigest():
-            raise ValueError("compact_v9 config_digest does not match config")
+    if not isinstance(config, dict) or not isinstance(digest, str):
+        raise ValueError("compact_v9 manifest must declare config and config_digest")
+    encoded = json.dumps(config, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode()
+    if digest != hashlib.sha256(encoded).hexdigest():
+        raise ValueError("compact_v9 config_digest does not match config")
     identities = manifest.get("input_identities")
     if not isinstance(identities, dict) or not identities:
         raise ValueError("compact_v9 input_identities must be a non-empty mapping of file identities")
+    limit_config = config.get("limit_reference", {})
+    contract_files = config.get("contract_files", [])
+    if not isinstance(limit_config, dict) or not isinstance(contract_files, list):
+        raise ValueError("compact_v9 manifest input identity configuration is malformed")
+    expected_identity_names = {"market", "factor", "factor_manifest"}
+    if limit_config.get("snapshot_path") is not None:
+        expected_identity_names.add("price_limit_snapshot")
+    expected_identity_names.update(f"contract_file_{index}" for index in range(len(contract_files)))
+    if set(identities) != expected_identity_names:
+        raise ValueError(
+            "compact_v9 input_identities keys do not match configured inputs: "
+            f"expected={sorted(expected_identity_names)} actual={sorted(identities)}"
+        )
     for name, identity in identities.items():
         if not isinstance(name, str) or not isinstance(identity, dict):
             raise ValueError("compact_v9 input_identities must map names to identity objects")
@@ -330,7 +344,11 @@ def audit_compact_v9(output_root: str | Path, *, require_fills: bool = False, re
     if manifest["match_mode"] == "maker":
         maker_fills = [row for row in maker if row.get("event_type") == "fill"]
         activity_maker_fills = _maker_fill_rows(fills)
-        if {row.get("order_id") for row in maker_fills} != {row.get("order_id") for row in activity_maker_fills}:
+        if (
+            len(maker_fills) != len(activity_maker_fills)
+            or sorted(row.get("order_id") for row in maker_fills)
+            != sorted(row.get("order_id") for row in activity_maker_fills)
+        ):
             errors.append("maker fill events and activity maker fills disagree")
         for row in maker:
             order = order_map.get(row.get("order_id"))
