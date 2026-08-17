@@ -68,14 +68,19 @@ def load_config(path: str | Path, profile_path: str | Path | None = None) -> Bac
         data = _deep_merge(data, profile)
     data = _expand_env(data)
     contract_files = data.get("contract_files", [])
+    resolved_contract_files: list[str] = []
     merged_contracts: dict[str, Any] = {}
     for item in contract_files:
         contract_path = Path(item)
         if not contract_path.is_absolute():
             contract_path = cfg_path.parent / contract_path
+        contract_path = contract_path.expanduser().resolve()
         with contract_path.open("r", encoding="utf-8") as fh:
             contract_data = yaml.safe_load(fh) or {}
+        resolved_contract_files.append(str(contract_path))
         merged_contracts.update(_expand_env(contract_data).get("contracts", {}))
+    if resolved_contract_files:
+        data["contract_files"] = resolved_contract_files
     merged_contracts.update(data.get("contracts", {}))
     if merged_contracts:
         data["contracts"] = merged_contracts

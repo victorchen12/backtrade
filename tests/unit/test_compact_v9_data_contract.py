@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import pandas as pd
 import pytest
 
+from backtrade.config.loader import load_config
 from backtrade.config.schema import BacktradeConfig
 from backtrade.data.future_l2 import JOIN_KEYS, merge_market_and_factors
 from backtrade.simulation.compact_v9 import _maker_fill_rows
@@ -96,3 +97,17 @@ def test_maker_audit_excludes_forced_taker_flatten_fills():
         {"order_id": "forced-1", "maker_taker_role": "taker", "boundary_reason": "day_end_flatten"},
     ]
     assert [row["order_id"] for row in _maker_fill_rows(fills)] == ["maker-1"]
+
+
+def test_loader_resolves_relative_contract_files_from_config_directory(tmp_path):
+    contract_path = tmp_path / "contracts.yaml"
+    config_path = tmp_path / "run.yaml"
+    contract_path.write_text("contracts: {}\n", encoding="utf-8")
+    config_path.write_text(
+        "contract_files:\n  - contracts.yaml\n"
+        "initial_cash: 1000\n"
+        "data:\n  product: ag\n  eof_is_day_end: true\n",
+        encoding="utf-8",
+    )
+    cfg = load_config(config_path)
+    assert cfg.contract_files == [contract_path.resolve()]
