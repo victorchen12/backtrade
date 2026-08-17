@@ -5,6 +5,7 @@ import pytest
 
 from backtrade.config.schema import BacktradeConfig
 from backtrade.data.future_l2 import JOIN_KEYS, merge_market_and_factors
+from backtrade.simulation.compact_v9 import _maker_fill_rows
 from backtrade.simulation.compact_v9_runner import CompactV9Result, CompactV9Runner
 
 
@@ -87,3 +88,11 @@ def test_manifest_uses_resolved_default_input_paths(tmp_path):
     assert {"market", "factor", "factor_manifest"} <= set(manifest["input_identities"])
     assert manifest["input_identities"]["market"]["resolved_path"] == str(market.resolve())
     assert manifest["input_identities"]["factor"]["resolved_path"] == str(factor.resolve())
+
+
+def test_maker_audit_excludes_forced_taker_flatten_fills():
+    fills = [
+        {"order_id": "maker-1", "maker_taker_role": "maker"},
+        {"order_id": "forced-1", "maker_taker_role": "taker", "boundary_reason": "day_end_flatten"},
+    ]
+    assert [row["order_id"] for row in _maker_fill_rows(fills)] == ["maker-1"]

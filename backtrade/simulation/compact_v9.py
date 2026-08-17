@@ -245,6 +245,10 @@ def read_compact_v9(output_root: str | Path) -> dict[str, Any]:
     return manifest
 
 
+def _maker_fill_rows(fills: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [row for row in fills if row.get("maker_taker_role") == "maker"]
+
+
 def audit_compact_v9(output_root: str | Path, *, require_fills: bool = False, require_final_flat: bool = False) -> dict[str, Any]:
     root = Path(output_root)
     try:
@@ -325,8 +329,9 @@ def audit_compact_v9(output_root: str | Path, *, require_fills: bool = False, re
                 errors.append(f"taker fill price differs from arrival L1 for {row.get('order_id')}")
     if manifest["match_mode"] == "maker":
         maker_fills = [row for row in maker if row.get("event_type") == "fill"]
-        if {row.get("order_id") for row in maker_fills} != {row.get("order_id") for row in fills}:
-            errors.append("maker fill events and activity fills disagree")
+        activity_maker_fills = _maker_fill_rows(fills)
+        if {row.get("order_id") for row in maker_fills} != {row.get("order_id") for row in activity_maker_fills}:
+            errors.append("maker fill events and activity maker fills disagree")
         for row in maker:
             order = order_map.get(row.get("order_id"))
             if order is None:
