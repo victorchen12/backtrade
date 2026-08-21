@@ -5,8 +5,8 @@ import math
 from backtrade.simulation.events import PortfolioTarget, StrategyView
 from backtrade.strategies.factors import (
     L1_IMBALANCE_NAME,
-    SUPPORTED_FACTOR_NAMES,
     factor_semantics_version,
+    validate_factor_name,
 )
 
 
@@ -16,11 +16,9 @@ class SignedFactorStrategy:
     required_features = frozenset({"active_factor"})
 
     def __init__(self, factor_name: str = L1_IMBALANCE_NAME) -> None:
-        if factor_name not in SUPPORTED_FACTOR_NAMES:
-            raise ValueError(f"compact_v9 supports only {sorted(SUPPORTED_FACTOR_NAMES)}")
-        self.factor_name = factor_name
-        self.factor_semantics_version = factor_semantics_version(factor_name)
-        self.reason_prefix = "l1"
+        self.factor_name = validate_factor_name(factor_name)
+        self.factor_semantics_version = factor_semantics_version(self.factor_name)
+        self.reason_prefix = "l1" if self.factor_name == L1_IMBALANCE_NAME else "factor"
 
     def on_decision(self, view: StrategyView, current_position: int) -> PortfolioTarget:
         if current_position not in {-1, 0, 1}:

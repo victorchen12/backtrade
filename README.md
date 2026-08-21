@@ -1,7 +1,7 @@
 # Backtrade v0.1.0
 
 Backtrade 是面向期货 L2 盘口快照的确定性模拟交易回测框架。
-v0.1 只正式支持一个 L1 盘口量不平衡因子、单品种、单手、
+v0.1 支持用户配置的单个有符号时间序列因子、单品种、单手、
 Taker 和 Maker 两种撮合模式。
 
 ## 使用边界
@@ -34,26 +34,30 @@ ask1_qty, ask2_qty, ask3_qty, ask4_qty, ask5_qty
 价格必须有限且符合盘口单调性；数量必须非负。
 \`last_prc_adj\` 和 \`adj_factor\` 只用于报告展示，不改变成交和账务价格。
 
-### 1.2 L1 因子文件
+### 1.2 因子文件
 
-已有因子文件至少包含：
+因子列名由 YAML 的 strategy.factor_column 指定。名称只允许英文字母、数字、点、下划线和连字符，
+且不能使用 tick_ts、product、active_factor 等框架保留列名。已有因子文件至少包含：
 
 \`\`\`text
-tick_ts, l1_imbalance
+tick_ts, <your_factor_name>
 \`\`\`
 
 也可以提供完整上下文：
 
 \`\`\`text
 product, trading_day, session_id, underlying_secu_cd,
-tick_ts, l1_imbalance
+tick_ts, <your_factor_name>
 \`\`\`
 
 \`tick_ts\` 必须唯一，并且必须对应市场快照中的实际 tick。
 因子文件同目录必须有 \`manifest.json\`，其中绑定因子哈希、市场哈希、
-商品和 \`factor_columns=["l1_imbalance"]\`。
+商品和实际配置的 factor_columns 列表。
 
-### 1.3 从市场快照生成因子
+### 1.3 内置 L1 因子（可选）
+
+这是框架内置的示例派生方式；自定义因子必须由用户先计算并写入因子 parquet，
+框架不会根据因子名称猜测或重算用户算法。
 
 \`l1_imbalance\` 的定义是：
 
@@ -71,7 +75,7 @@ tick_ts, l1_imbalance
 \`\`\`text
 input/
 ├── market.parquet
-└── l1_imbalance.parquet
+└── <your_factor_name>.parquet
 \`\`\`
 
 也可以直接在命令行传入任意文件路径。
@@ -90,13 +94,13 @@ paths:
 data:
   product: ag
   market_path: ./input/market.parquet
-  factor_path: ./input/l1_imbalance.parquet
+  factor_path: ./input/my_ofi.parquet
   factor_grid_mode: decision_grid
   eof_is_day_end: true
 
 strategy:
-  factor_name: l1_imbalance
-  factor_column: l1_imbalance
+  factor_name: my_ofi
+  factor_column: my_ofi
 
 match:
   mode: taker
@@ -195,6 +199,18 @@ python -m backtrade.cli prepare-input \
 已有两份输入时，直接执行 \`prepare-input\` 即可。
 
 先校验：
+如果使用自定义因子，例如列名 my_ofi：
+
+\`\`\`sh
+python -m backtrade.cli prepare-input \
+  --product ag \
+  --market-path /data/team/market.parquet \
+  --factor-path /data/team/my_ofi.parquet \
+  --factor-column my_ofi
+\`\`\`
+
+同时把 YAML 的 strategy.factor_name 和 strategy.factor_column 都改为 my_ofi，
+并把下面命令中的 --factor-path 替换为 /data/team/my_ofi.parquet，再执行 validate 和 run。
 
 \`\`\`sh
 python -m backtrade.cli validate \

@@ -1,14 +1,14 @@
 # Backtrade v0.1.0 架构
 
-本文描述 v0.1.0 的 L1 盘口量不平衡回测主链路。
+本文描述 v0.1.0 的用户有符号因子回测主链路；\`l1_imbalance\` 是内置示例。
 模型限定为单品种、单手、无保证金和无组合持仓。
 
 ## 1. 分层概览
 
 | 层 | 主要模块 | 输入 | 输出 |
 | --- | --- | --- | --- |
-| Data 数据 | \`data.future_l2\`、\`data.market_quality\`、\`data.limit_reference\`、\`data.replay\` | L2 快照、L1 因子、配置 | 校验输入身份，完成因果对齐，整理 \`MarketTick\` |
-| Strategy 策略 | \`strategies.signed_factor.SignedFactorStrategy\` | 已完成的 L1 因子和当前仓位 | 输出 \`PortfolioTarget\` |
+| Data 数据 | \`data.future_l2\`、\`data.market_quality\`、\`data.limit_reference\`、\`data.replay\` | L2 快照、用户因子、配置 | 校验输入身份，完成因果对齐，整理 \`MarketTick\` |
+| Strategy 策略 | \`strategies.signed_factor.SignedFactorStrategy\` | 已完成的有符号因子和当前仓位 | 输出 \`PortfolioTarget\` |
 | Order / Matching 订单与撮合 | \`simulation.execution\`、\`order_match.taker\`、\`order_match.maker\` | 目标仓位、延迟、盘口视图 | 输出订单状态、成交和撮合证据 |
 | Simulation 模拟交易 | \`simulation.compact_v9_runner\`、\`simulation.events\` | tick、目标、订单、成交 | 驱动生命周期、边界和序号 |
 | Accounting 会计账本 | \`position.single_lot.SingleLotAccount\` | 成交、费用、合约规则 | 更新持仓、现金、权益和 PnL |
@@ -20,7 +20,7 @@
 flowchart TD
     I[配置和输入身份] --> D[Data 数据层]
     M[market.parquet L2 快照] --> D
-    F[l1_imbalance.parquet + manifest] --> D
+    F[用户因子 parquet + manifest] --> D
     D -->|校验和因果 decision_grid 对齐| R[MarketReplay 逐 tick 回放]
     R -->|StrategyView| S[SignedFactorStrategy]
     S -->|PortfolioTarget| E[订单生成和延迟]
@@ -37,7 +37,7 @@ flowchart TD
 
 ## 3. Data 和因子对齐
 
-市场快照可以直接配套已有 L1 因子，也可以先由 CLI 从买一和卖一数量生成。
+市场快照可以直接配套用户计算的有符号因子；内置 \`l1_imbalance\` 也可以由 CLI 从买一和卖一数量生成。
 生成后的因子文件仍然作为独立输入，并由 manifest 绑定市场哈希和因子哈希。
 
 Data 层只执行因果 \`decision_grid\` backward as-of join：
@@ -49,7 +49,7 @@ Data 层只执行因果 \`decision_grid\` backward as-of join：
 
 ## 4. 策略和订单
 
-\`signed_factor_v1\` 将 L1 因子映射为目标仓位：
+\`signed_factor_v1\` 将配置的有符号因子映射为目标仓位：
 
 - 正值：目标为一手多头；
 - 负值：目标为一手空头；

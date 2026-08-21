@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from backtrade.strategies.factors import validate_factor_name
 
 
 FeeMode = Literal["per_lot", "rate", "bps"]
@@ -128,9 +129,14 @@ class DataSourceConfig(BaseModel):
 
 class StrategyConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    # [README-4] 当前 v0.1 只支持 L1 盘口量不平衡；两字段必须一致。
-    factor_name: Literal["l1_imbalance"] = "l1_imbalance"
-    factor_column: Literal["l1_imbalance"] = "l1_imbalance"
+    # [README-4] 因子名称由用户配置；两字段必须一致，并使用安全列名。
+    factor_name: str = "l1_imbalance"
+    factor_column: str = "l1_imbalance"
+
+    @field_validator("factor_name", "factor_column")
+    @classmethod
+    def validate_factor_identifier(cls, value: str) -> str:
+        return validate_factor_name(value)
 
     @model_validator(mode="after")
     def validate_factor_pair(self) -> "StrategyConfig":

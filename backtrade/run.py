@@ -9,7 +9,7 @@ from backtrade.data.future_l2 import iter_future_l2_ticks
 from backtrade.simulation.compact_v9 import audit_compact_v9
 from backtrade.simulation.compact_v9_runner import CompactV9Runner
 from backtrade.runtime.manifest import payload_digest
-from backtrade.strategies.factors import SUPPORTED_FACTOR_NAMES
+from backtrade.strategies.factors import validate_factor_name
 
 
 def _allowed_reset_root(path: Path) -> bool:
@@ -31,7 +31,11 @@ def run_from_config(
 ) -> dict[str, Any]:
     if cfg.data.source != "future_l2":
         raise ValueError("compact_v9 requires data.source=future_l2")
-    if cfg.strategy.factor_name not in SUPPORTED_FACTOR_NAMES or cfg.strategy.factor_column != cfg.strategy.factor_name:
+    try:
+        validate_factor_name(cfg.strategy.factor_name)
+    except ValueError as exc:
+        raise ValueError(f"compact_v9 does not support factor {cfg.strategy.factor_name}") from exc
+    if cfg.strategy.factor_column != cfg.strategy.factor_name:
         raise ValueError(f"compact_v9 does not support factor {cfg.strategy.factor_name}")
     if max_events is not None and int(max_events) <= 0:
         raise ValueError("max_events must be positive when provided")

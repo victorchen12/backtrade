@@ -17,7 +17,7 @@ from backtrade.data.limit_reference import (
 )
 from backtrade.data.market_quality import derive_market_quality_flags
 from backtrade.simulation.events import MarketTick
-from backtrade.strategies.factors import L1_IMBALANCE_NAME, SUPPORTED_FACTOR_NAMES
+from backtrade.strategies.factors import L1_IMBALANCE_NAME, validate_factor_name
 from backtrade.simulation.state import OrderSide
 
 
@@ -55,7 +55,7 @@ def selected_factor_screen_path(cfg: BacktradeConfig) -> Path:
     # [README-1] 因子输入路径：显式 factor_path 优先，manifest.json 与其同目录。
     if cfg.data.factor_path is not None:
         return Path(cfg.data.factor_path)
-    return cfg.paths.future_l2_data_root / "factor_data" / str(cfg.data.product).lower() / "l1_imbalance.parquet"
+    return cfg.paths.future_l2_data_root / "factor_data" / str(cfg.data.product).lower() / f"{cfg.strategy.factor_column}.parquet"
 
 
 def factor_grid_mode(cfg: BacktradeConfig) -> str:
@@ -91,6 +91,7 @@ def enrich_factor_keys(market: pd.DataFrame, factors: pd.DataFrame, *, factor_na
     instead of guessing a contract or session.
     """
 
+    factor_name = validate_factor_name(factor_name)
     if "tick_ts" not in factors.columns or factor_name not in factors.columns:
         raise KeyError(f"minimal factor parquet requires tick_ts and {factor_name}")
     context_keys = set(JOIN_KEYS) - {"tick_ts"}
@@ -127,6 +128,7 @@ def enrich_factor_keys(market: pd.DataFrame, factors: pd.DataFrame, *, factor_na
 
 def merge_market_and_factors(market: pd.DataFrame, factors: pd.DataFrame, *, factor_grid_mode: str = "decision_grid", factor_name: str = FACTOR_NAME) -> pd.DataFrame:
     # [README-3] 只做 backward as-of 对齐；因子源 tick 才触发新决策。
+    factor_name = validate_factor_name(factor_name)
     if factor_grid_mode != "decision_grid":
         raise ValueError("compact_v9 only supports causal decision_grid joins")
     _require_keys(market, "market")
@@ -166,8 +168,7 @@ def _sha256(path: Path) -> str:
 
 def _validate_factor_manifest(cfg: BacktradeConfig, factor_path: Path) -> dict:
     factor_name = cfg.strategy.factor_column
-    if factor_name not in SUPPORTED_FACTOR_NAMES:
-        raise ValueError(f"unsupported factor: {factor_name}")
+    factor_name = validate_factor_name(factor_name)
     manifest_path = _factor_manifest_path(cfg)
     if not manifest_path.is_file():
         raise FileNotFoundError(f"canonical factor manifest is missing: {manifest_path}")

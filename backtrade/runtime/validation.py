@@ -5,7 +5,7 @@ from typing import Any
 
 import pyarrow.parquet as pq
 
-from backtrade.strategies.factors import SUPPORTED_FACTOR_NAMES
+from backtrade.strategies.factors import validate_factor_name
 from backtrade.data.future_l2 import (
     JOIN_KEYS,
     MARKET_COLUMNS,
@@ -25,8 +25,12 @@ def validate_config(cfg) -> dict[str, Any]:
         errors.append("only data.source=future_l2 is supported")
     if cfg.match.mode not in {"maker", "taker"}:
         errors.append("only match.mode=maker or taker is supported")
-    if cfg.strategy.factor_name not in SUPPORTED_FACTOR_NAMES or cfg.strategy.factor_column != cfg.strategy.factor_name:
-        errors.append(f"unsupported factor configuration: {cfg.strategy.factor_name}/{cfg.strategy.factor_column}")
+    try:
+        validate_factor_name(cfg.strategy.factor_name)
+    except ValueError as exc:
+        errors.append(str(exc))
+    if cfg.strategy.factor_column != cfg.strategy.factor_name:
+        errors.append(f"factor configuration names must match: {cfg.strategy.factor_name}/{cfg.strategy.factor_column}")
     if cfg.limit_reference.mode == "prev_day_vwap_proxy":
         warnings.append("prev_day_vwap_proxy is an explicit approximation, not an official settlement price")
     if cfg.data.max_ticks is None and not cfg.data.eof_is_day_end:
