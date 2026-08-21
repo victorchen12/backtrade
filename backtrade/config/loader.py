@@ -10,8 +10,6 @@ import yaml
 from backtrade.config.schema import BacktradeConfig
 
 
-PROJECT_WRITE_ROOT = Path("/home/cws/QUANT/Backtrade")
-OUTPUT_WRITE_ROOT = Path("/data1/cws/backtrade")
 FORBIDDEN_WRITE_ROOT = Path("/mnt/nvme")
 
 
@@ -33,6 +31,15 @@ def _is_relative_to(path: Path, root: Path) -> bool:
         return False
 
 
+def validate_result_view_root(path: str | Path) -> Path:
+    resolved = Path(path).expanduser().resolve()
+    # [README-2] 报告目录可由用户选择；仍拒绝明确禁止的写入根。
+    if _is_relative_to(resolved, FORBIDDEN_WRITE_ROOT):
+        raise ValueError(f"result_view_root cannot point under /mnt/nvme: {resolved}")
+    return resolved
+
+
+# [README-2] 输出路径由配置或 CLI 指定；运行层拒绝非空目录，清理仍保留批准根保护。
 def _validate_write_paths(cfg: BacktradeConfig) -> None:
     write_paths = {
         "project_root": cfg.paths.project_root,
@@ -42,10 +49,7 @@ def _validate_write_paths(cfg: BacktradeConfig) -> None:
         if _is_relative_to(path, FORBIDDEN_WRITE_ROOT):
             raise ValueError(f"{name} cannot point under /mnt/nvme: {path}")
 
-    if not _is_relative_to(cfg.paths.project_root, PROJECT_WRITE_ROOT):
-        raise ValueError(f"project_root must stay under {PROJECT_WRITE_ROOT}: {cfg.paths.project_root}")
-    if not _is_relative_to(cfg.paths.output_root, OUTPUT_WRITE_ROOT):
-        raise ValueError(f"output_root must stay under {OUTPUT_WRITE_ROOT}: {cfg.paths.output_root}")
+    validate_result_view_root(cfg.paths.result_view_root)
 
 
 def _deep_merge(base: dict[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
@@ -58,6 +62,8 @@ def _deep_merge(base: dict[str, Any], override: Mapping[str, Any]) -> dict[str, 
     return merged
 
 
+# [README-2] profile 深度覆盖主 YAML，适合把机器相关路径集中放在一个文件。
+# [README-2] 字符串支持环境变量展开，例如 BACKTRADE_DATA_ROOT。
 def load_config(path: str | Path, profile_path: str | Path | None = None) -> BacktradeConfig:
     cfg_path = Path(path)
     with cfg_path.open("r", encoding="utf-8") as fh:

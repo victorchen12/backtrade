@@ -3,3 +3,11 @@ __pycache__/
 .pytest_cache/
 configs/profiles/*.yaml
 !configs/profiles/*.example.yaml
+result_view/
+runs/
+campaigns/
+inputs/
+*.parquet
+*.html
+**/manifest.json
+*.log

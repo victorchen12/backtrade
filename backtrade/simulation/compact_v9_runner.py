@@ -18,7 +18,8 @@ from backtrade.simulation.compact_v9 import CompactV9ParquetOutput
 from backtrade.simulation.events import BoundaryEvent, FillEvent, MatchView, MarketTick, Order, PortfolioTarget
 from backtrade.simulation.execution import ExecutionEngine, normalize_target_qty
 from backtrade.simulation.state import MatchMode, OrderSide, OrderStatus, OrderType, TimeInForce, TERMINAL_STATUSES
-from backtrade.strategies.ofi import OFISignStrategy
+from backtrade.strategies.signed_factor import SignedFactorStrategy
+from backtrade.strategies.factors import factor_semantics_version
 from backtrade.runtime.manifest import payload_digest
 
 
@@ -83,7 +84,7 @@ class CompactV9Runner:
             raise ValueError("compact_v9 requires match.mode=maker or taker")
         self.cfg = cfg
         self.ticks = iter(ticks)
-        self.strategy = strategy or OFISignStrategy(cfg.strategy.factor_name)
+        self.strategy = strategy or SignedFactorStrategy(cfg.strategy.factor_name)
         self.execution = ExecutionEngine(cfg)
         self.account = SingleLotAccount(cfg.initial_cash)
         self.matcher = MakerMatcher() if cfg.match.mode == "maker" else TakerMatcher()
@@ -117,14 +118,6 @@ class CompactV9Runner:
             if key in self.cfg.contracts:
                 return self.cfg.contracts[key]
         raise ValueError(f"missing contract rule for {contract}")
-    def _effective_position(self, product: str) -> int:
-        actual = self.account.net_qty(product)
-        pending = [order for order in self._active_for_product(product) if order.created.open_qty > 0]
-        signed = actual + sum(1 if order.created.side is OrderSide.BUY else -1 for order in pending)
-        if signed not in {-1, 0, 1}:
-            raise RuntimeError(f"effective single-lot position overflow for {product}: {signed}")
-        return signed
-
     @staticmethod
     def _terminal(order: Order) -> bool:
         return order.status in TERMINAL_STATUSES or order.executed.remaining_qty <= 0
@@ -143,9 +136,8 @@ class CompactV9Runner:
         return 1 if orders[0].created.side is OrderSide.BUY else -1
 
     def _append_target_activity(self, target: PortfolioTarget, tick: MarketTick) -> None:
-        effective_position = self._effective_position(target.product)
         actual_position = self.account.net_qty(target.product)
-        target.position_before = effective_position
+        target.position_before = actual_position
         self.activity_rows.append({
             "source_dataset": "target",
             "record_type": "target",
@@ -450,21 +442,32 @@ class CompactV9Runner:
         view: MatchView,
         current: int,
         *,
-        effective_current: int | None = None,
         reject_open_reason: str | None = None,
     ) -> None:
         target.target_seq = target.target_seq or self._next_target_seq
         self._next_target_seq = max(self._next_target_seq, int(target.target_seq) + 1)
         self._append_target_activity(target, tick)
         desired = normalize_target_qty(target.target_qty)
-        strategy_current = current if effective_current is None else effective_current
+        strategy_current = current
+        wanted = desired - strategy_current
         existing = self._active_for_product(target.product)
-        if desired == strategy_current:
+        if wanted == 0:
+            for order in existing:
+                self._cancel_order(order, "target_changed_cancel_active_order", tick.tick_ts, view=view)
+            self.pending_orders = [item for item in self.pending_orders if item not in existing]
+            self.active_orders = [item for item in self.active_orders if item not in existing]
             return
+        wanted_side = OrderSide.BUY if wanted > 0 else OrderSide.SELL
+        wanted_open_qty = 1 if strategy_current == 0 else 0
+        wanted_close_qty = 1 if strategy_current != 0 else 0
         if existing:
-            signed = 1 if existing[0].created.side is OrderSide.BUY else -1
-            wanted = desired - strategy_current
-            if signed == (1 if wanted > 0 else -1):
+            if (
+                len(existing) == 1
+                and existing[0].created.side is wanted_side
+                and existing[0].created.open_qty == wanted_open_qty
+                and existing[0].created.close_qty == wanted_close_qty
+                and existing[0].created.reduce_only == bool(wanted_close_qty)
+            ):
                 return
             for order in existing:
                 self._cancel_order(order, "target_changed_cancel_active_order", tick.tick_ts, view=view)
@@ -650,9 +653,8 @@ class CompactV9Runner:
                     if current != 0:
                         self._flatten(tick.product, tick.contract, view, risk_reason)
                     elif strategy_view.factor_decision:
-                        effective_current = self._effective_position(tick.product)
-                        target = self.strategy.on_decision(strategy_view, effective_current)
-                        self._submit_target(target, tick, view, current, effective_current=effective_current, reject_open_reason=risk_reason)
+                        target = self.strategy.on_decision(strategy_view, current)
+                        self._submit_target(target, tick, view, current, reject_open_reason=risk_reason)
                 else:
                     for order in list(self.pending_orders):
                         if order.arrival_ts is not None and order.arrival_ts <= tick.tick_ts:
@@ -668,9 +670,8 @@ class CompactV9Runner:
                         self._cancel_product_orders(tick.product, f"{risk_reason}_cancel_active_order", tick.tick_ts, view=view)
                         self._flatten(tick.product, tick.contract, view, risk_reason)
                     elif strategy_view.factor_decision:
-                        effective_current = self._effective_position(tick.product)
-                        target = self.strategy.on_decision(strategy_view, effective_current)
-                        self._submit_target(target, tick, view, current, effective_current=effective_current, reject_open_reason=risk_reason)
+                        target = self.strategy.on_decision(strategy_view, current)
+                        self._submit_target(target, tick, view, current, reject_open_reason=risk_reason)
             snapshot_reason = "contract_roll_flatten" if strategy_view.is_last_tick_of_contract else "day_end_flatten" if strategy_view.is_last_tick_of_day else "day_end_cancel_active_order" if boundary_start else "tick"
             self.snapshots.append(self._snapshot_record(tick, snapshot_reason))
             self._previous_tick = tick
@@ -693,7 +694,7 @@ class CompactV9Runner:
                 row["record_type"] = row.get("source_dataset")
         return CompactV9Result(self.orders, self.fills, self.account_rows, self.snapshots, self.activity_rows, self.maker_events, self.boundary_events, final)
 
-    def _manifest_payload(self, result: CompactV9Result) -> dict[str, Any]:
+    def _manifest_payload(self, result: CompactV9Result, *, output_root: str | Path | None = None) -> dict[str, Any]:
         def identity(path: str | Path | None) -> dict[str, Any] | None:
             if path is None:
                 return None
@@ -717,8 +718,10 @@ class CompactV9Runner:
             Path(__file__).parents[1] / "simulation" / "execution.py",
             Path(__file__).parents[1] / "simulation" / "events.py",
             Path(__file__).parents[1] / "position" / "single_lot.py",
-            Path(__file__).parents[1] / "strategies" / "ofi.py",
+            Path(__file__).parents[1] / "strategies" / "signed_factor.py",
+            Path(__file__).parents[1] / "strategies" / "factors.py",
             Path(__file__).parents[1] / "data" / "future_l2.py",
+            Path(__file__).parents[1] / "data" / "market_quality.py",
             Path(__file__).parents[1] / "data" / "replay.py",
         ]
         repo_root = Path(__file__).resolve().parents[2]
@@ -735,10 +738,12 @@ class CompactV9Runner:
         bounded = bool(self.cfg.data.max_ticks is not None or self._max_events is not None)
         max_events = self._max_events
         return {
+        # [README-6] manifest 记录 writer 实际收到的输出目录，而不是配置默认目录。
             "engine_version": "compact_v9_core",
-            "strategy_name": "ofi",
+            "output_root": str(Path(output_root).expanduser().resolve()) if output_root is not None else None,
+            "strategy_name": "signed_factor",
             "factor_name": self.cfg.strategy.factor_name,
-            "factor_semantics_version": "ofi_sign_v1",
+            "factor_semantics_version": factor_semantics_version(self.cfg.strategy.factor_name),
             "match_mode": self.cfg.match.mode,
             "config": config,
             "config_digest": payload_digest(config),
@@ -774,7 +779,7 @@ class CompactV9Runner:
         sink.write_many("snapshot", result.snapshots)
         if self.cfg.match.mode == "maker":
             sink.write_many("maker_event", result.maker_events)
-        manifest = self._manifest_payload(result)
+        manifest = self._manifest_payload(result, output_root=output_root)
         return sink.close(manifest=manifest)
 
 

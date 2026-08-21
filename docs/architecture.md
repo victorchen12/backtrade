@@ -1,76 +1,87 @@
-# Backtrade compact_v9 架构与信息流
+# Backtrade v0.1.0 架构
 
-本文只描述当前真实路径。synthetic、full-tick、外部方向过滤和旧
-compact_v6/v8 分支不属于当前契约。
+本文描述 v0.1.0 的 L1 盘口量不平衡回测主链路。
+模型限定为单品种、单手、无保证金和无组合持仓。
 
-## 1. 主流程
+## 1. 分层概览
 
-```mermaid
-flowchart LR
-    C[配置 YAML] --> L[config.loader/schema]
-    M[市场 L2 快照] --> D[data.future_l2]
-    F[OFI parquet + manifest] --> D
-    R[价格限制 snapshot] --> D
-    D --> J[因果 decision_grid as-of join]
-    J --> P[data.replay.MarketReplay]
-    P --> S[strategies.ofi / ofi_sign_v1]
-    S --> E[simulation.execution / 一手订单]
-    E --> T[order_match.taker]
-    E --> K[order_match.maker / MBP expected-queue]
-    T --> A[position.single_lot]
-    K --> A
-    A --> W[compact_v9 parquet writer]
-    W --> V[reader + audit_compact_v9]
-```
+| 层 | 主要模块 | 输入 | 输出 |
+| --- | --- | --- | --- |
+| Data 数据 | \`data.future_l2\`、\`data.market_quality\`、\`data.limit_reference\`、\`data.replay\` | L2 快照、L1 因子、配置 | 校验输入身份，完成因果对齐，整理 \`MarketTick\` |
+| Strategy 策略 | \`strategies.signed_factor.SignedFactorStrategy\` | 已完成的 L1 因子和当前仓位 | 输出 \`PortfolioTarget\` |
+| Order / Matching 订单与撮合 | \`simulation.execution\`、\`order_match.taker\`、\`order_match.maker\` | 目标仓位、延迟、盘口视图 | 输出订单状态、成交和撮合证据 |
+| Simulation 模拟交易 | \`simulation.compact_v9_runner\`、\`simulation.events\` | tick、目标、订单、成交 | 驱动生命周期、边界和序号 |
+| Accounting 会计账本 | \`position.single_lot.SingleLotAccount\` | 成交、费用、合约规则 | 更新持仓、现金、权益和 PnL |
+| Output / Audit 产物与审计 | \`simulation.compact_v9\`、\`runtime\`、\`reporting\` | 运行状态和输入身份 | Parquet、manifest、审计结果和 HTML |
 
-## 2. 数据与时间边界
+## 2. 主数据流
 
-`future_l2` 先校验因子 manifest 版本、唯一因子列、parquet 哈希、连接键和
-选择范围，再按 product、trading_day、session、underlying contract 做
-backward as-of join。只有源时间与行情时间精确相等时才产生
-`factor_decision=true`，其他行情只携带旧因子，不能前视。
+\`\`\`mermaid
+flowchart TD
+    I[配置和输入身份] --> D[Data 数据层]
+    M[market.parquet L2 快照] --> D
+    F[l1_imbalance.parquet + manifest] --> D
+    D -->|校验和因果 decision_grid 对齐| R[MarketReplay 逐 tick 回放]
+    R -->|StrategyView| S[SignedFactorStrategy]
+    S -->|PortfolioTarget| E[订单生成和延迟]
+    R -->|MatchView| X{Taker / Maker 撮合}
+    E -->|Order| X
+    X -->|FillEvent 和撮合证据| A[SingleLotAccount 会计账本]
+    A -->|现金、持仓、PnL、费用| C[Runner 运行协调]
+    C --> W[Parquet writer + manifest]
+    W --> V[Reader + audit_compact_v9]
+    V --> H[HTML 报告和指标]
+\`\`\`
 
-`MarketReplay` 检查单品种时间/源序号、交易日和换月顺序，并提供
-`StrategyView` 与 `MatchView`。完整无界流只有显式
-`eof_is_day_end=true` 才把 EOF 作为已知日末；有 `max-events` 或
-`max_ticks` 时 EOF 是 `end_of_data`。换月与日末重合只保留一次
-`contract_roll_flatten`。
+\`CompactV9Runner\` 在每个 tick 上协调回放、策略、订单、撮合和会计更新。
 
-## 3. 信号、订单、撮合
+## 3. Data 和因子对齐
 
-` OFISignStrategy` 固定实现 `ofi_sign_v1`：正值为 +1，负值为 -1，零值保持；
-反向目标先输出 reduce-only 平仓。`ExecutionEngine` 负责延迟和一手订单。
-Taker 使用到达行情的对手 L1；Maker 挂在决策时同侧 L1。
+市场快照可以直接配套已有 L1 因子，也可以先由 CLI 从买一和卖一数量生成。
+生成后的因子文件仍然作为独立输入，并由 manifest 绑定市场哈希和因子哈希。
 
-`MakerMatcher` 是 MBP expected-queue 估计器，manifest 明确
-`FIFO_reconstruction=false`。同价成交先扣 `queue_ahead`，只有队列达到零
-才 fill；strict trade-through 需要高置信度反向成交且价格严格穿过挂单。坏
-行情重新建立可见深度但不推进队列；首次离开 L1 或会 cross quote 的订单拒绝，
-排队后离开 L1 的订单撤单。它不声称重建交易所 FIFO。
+Data 层只执行因果 \`decision_grid\` backward as-of join：
 
-## 4. 生命周期与账务
+- 因子源 tick 与行情 tick 时间相等时，设置 \`factor_decision=true\`；
+- 中间行情只携带最近的已完成因子；
+- 任何未来因子都不能参与当前决策；
+- 完整流 EOF 可以声明为已知日末；抽样 EOF 只能是 \`end_of_data\`。
 
-runner 独占 target/order/fill 序号和账务写入。边界先撤销活动单，持仓存在时
-用无延迟 taker 强平；EOF 残余持仓使用 `end_of_data_flatten`。账户每个品种
-只保留一个开仓仓位，按合约乘数计算毛利并选择 `close_today` 或 `close`
-费用。每行 `net_pnl` 是该 fill 的现金变化，必须满足：
+## 4. 策略和订单
 
-```text
-sum(account.net_pnl) = final_cash - initial_cash
-sum(account.net_pnl) = realized_pnl - total_fee
-```
+\`signed_factor_v1\` 将 L1 因子映射为目标仓位：
 
-## 5. manifest 与审计
+- 正值：目标为一手多头；
+- 负值：目标为一手空头；
+- 零值：保持当前仓位；
+- 反向：先输出平仓目标，再输出反向开仓目标。
 
-writer 关闭 parquet 后才计算最终文件哈希。manifest 包含固定文件清单、config
-digest、实际 market/factor/factor manifest/价格限制/合约文件身份、Git revision
-和 dirty 状态、核心源码哈希、latency、EOF 边界及 maker 声明。reader 验证物理
-schema、文件清单/哈希、config digest 和输入身份；`audit_compact_v9` 再检查
-目标语义、延迟、taker L1、maker 严格证据、fill/account 一对一、现金/PnL
-守恒和最终 flat。
+订单包含决策时间、到达时间、方向、数量、目标序号和因子元数据。
+撮合层不重新解释策略信号。
 
-## 6. 范围
+## 5. Taker 和 Maker
 
-适用场景是：一个人拿到符合契约的 L2 快照、canonical OFI 因子和配置后复现
-单品种单手回测。不重建 FIFO，不提供官方结算价，不模拟多手、保证金或组合
-持仓；`prev_day_vwap_proxy` 只是显式近似。
+Taker 在订单到达 tick 使用对手 L1 成交。
+Maker 使用 MBP expected-queue 估计，不声称交易所 FIFO 重建。
+
+Maker 的关键规则：
+
+- 等价价先消耗 queue_ahead；
+- 只有严格穿过挂单价才允许 trade-through；
+- stale、anomaly、side-ambiguous 行情不推进队列；
+- 初次不在 L1 或会立即吃单时 rejected；
+- 已排队后离开 L1 时 cancel。
+
+两种模式共用 Data、Strategy、Simulation、Accounting 和 Output 契约。
+
+## 6. 会计和产物
+
+每个成交只产生一次会计事件：
+
+- 开仓：\`net_pnl = -open_fee\`；
+- 平仓：\`net_pnl = gross_pnl - close_fee\`。
+
+审计要求现金、累计 PnL、手续费和最终空仓守恒。
+manifest 记录输入身份、配置摘要、代码来源、EOF 边界、延迟、撮合模式和最终文件哈希。
+
+当前版本不支持多手、保证金、组合持仓、官方结算价或交易所 FIFO。

@@ -1,12 +1,10 @@
-# Changelog
+# 更新记录
 
-## compact_v9 core recovery baseline
+## v0.1.0
 
-- Restored a valid Git repository at the Backtrade project root.
-- Kept only the canonical future_l2 plus ofi_cks_best_level_5s decision-grid path.
-- Fixed EOF/day-end distinction, zero-window lifecycle handling, strict maker
-  equality/trade-through evidence, and single-lot cash/PnL conservation.
-- Added final artifact hashes, input identities, config digest, and measured Git
-  provenance to the compact_v9 manifest and audit.
-- Removed unconnected external-directional, synthetic, legacy matching, and old
-  compact branches from the supported tree.
+- 首个团队内部可用版本。
+- 正式支持 \`l1_imbalance\` 和 \`signed_factor_v1\`。
+- 支持 Taker 与 Maker 两种撮合模式。
+- 保留严格 maker 等价价队列、trade-through 和异常行情证据。
+- 保留因果 decision_grid、EOF 日末边界和现金/PnL 守恒审计。
+- 明确单品种、单手、无保证金、无组合持仓、无官方结算价和无交易所 FIFO 重建。

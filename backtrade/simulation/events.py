@@ -147,9 +147,9 @@ class PortfolioTarget:
     reduce_only: bool = False
     risk_state: str = "normal"
     reason_code: str = "strategy_signal"
-    factor_name: str = "ofi_cks_best_level_5s"
+    factor_name: str = "l1_imbalance"
     factor_score: float | None = None
-    factor_semantics_version: str = "ofi_sign_v1"
+    factor_semantics_version: str = "signed_factor_v1"
     factor_decision: bool = True
     factor_source_ts: datetime | None = None
     factor_age_ms: float | None = None

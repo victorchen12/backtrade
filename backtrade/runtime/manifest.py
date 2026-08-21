@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from backtrade.strategies.factors import factor_semantics_version
+
 
 def _jsonable(value: Any) -> Any:
     if isinstance(value, Path):
@@ -54,7 +56,7 @@ def build_run_manifest(cfg, *, run_id: str, output_root: str | Path, input_manif
         "config_digest": payload_digest(config),
         "input_manifest": _jsonable(input_manifest or {}),
         "match_mode": cfg.match.mode,
-        "factor_semantics_version": "ofi_sign_v1",
+        "factor_semantics_version": factor_semantics_version(cfg.strategy.factor_name),
     }
 
 

@@ -3,39 +3,45 @@ from __future__ import annotations
 import math
 
 from backtrade.simulation.events import PortfolioTarget, StrategyView
+from backtrade.strategies.factors import (
+    L1_IMBALANCE_NAME,
+    SUPPORTED_FACTOR_NAMES,
+    factor_semantics_version,
+)
 
 
-class OFISignStrategy:
-    """Map a completed five-second OFI value to a single-lot signed target."""
+class SignedFactorStrategy:
+    """将已完成的有符号因子值映射为单手目标仓位。"""
 
     required_features = frozenset({"active_factor"})
-    factor_semantics_version = "ofi_sign_v1"
 
-    def __init__(self, factor_name: str = "ofi_cks_best_level_5s") -> None:
-        if factor_name != "ofi_cks_best_level_5s":
-            raise ValueError("compact_v9 supports only ofi_cks_best_level_5s")
+    def __init__(self, factor_name: str = L1_IMBALANCE_NAME) -> None:
+        if factor_name not in SUPPORTED_FACTOR_NAMES:
+            raise ValueError(f"compact_v9 supports only {sorted(SUPPORTED_FACTOR_NAMES)}")
         self.factor_name = factor_name
+        self.factor_semantics_version = factor_semantics_version(factor_name)
+        self.reason_prefix = "l1"
 
     def on_decision(self, view: StrategyView, current_position: int) -> PortfolioTarget:
         if current_position not in {-1, 0, 1}:
-            raise ValueError("OFI sign strategy requires current position in {-1, 0, +1}")
+            raise ValueError("signed factor strategy requires current position in {-1, 0, +1}")
         score = view.factors.get("active_factor")
         if not view.factor_decision:
-            return self._target(view, current_position, None, "ofi_factor_wait")
+            return self._target(view, current_position, None, f"{self.reason_prefix}_factor_wait")
         if score is None or not math.isfinite(float(score)):
-            raise ValueError("OFI sign strategy requires a finite active_factor on decision ticks")
+            raise ValueError("signed factor strategy requires a finite active_factor on decision ticks")
         score = float(score)
         desired = 1 if score > 0 else -1 if score < 0 else current_position
         if score == 0:
-            reason = "ofi_hold_zero"
+            reason = f"{self.reason_prefix}_hold_zero"
         elif current_position and desired != current_position:
-            return self._target(view, 0, score, "ofi_flat_for_reversal", reduce_only=True)
+            return self._target(view, 0, score, f"{self.reason_prefix}_flat_for_reversal", reduce_only=True)
         elif desired > 0:
-            reason = "ofi_long" if current_position == 0 else "ofi_hold_long"
+            reason = f"{self.reason_prefix}_long" if current_position == 0 else f"{self.reason_prefix}_hold_long"
         elif desired < 0:
-            reason = "ofi_short" if current_position == 0 else "ofi_hold_short"
+            reason = f"{self.reason_prefix}_short" if current_position == 0 else f"{self.reason_prefix}_hold_short"
         else:
-            reason = "ofi_flat"
+            reason = f"{self.reason_prefix}_flat"
         return self._target(view, desired, score, reason)
 
     def _target(
@@ -64,4 +70,4 @@ class OFISignStrategy:
         )
 
 
-__all__ = ["OFISignStrategy"]
+__all__ = ["SignedFactorStrategy"]

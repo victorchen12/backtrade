@@ -37,7 +37,7 @@ def _factor(ts, score):
                 "session_id": "day",
                 "tick_ts": ts,
                 "underlying_secu_cd": "AG2604",
-                "ofi_cks_best_level_5s": score,
+                "l1_imbalance": score,
                 "active_factor": score,
             }
         ]
@@ -70,7 +70,7 @@ def test_old_position_filter_and_tolerance_fields_are_rejected():
 
 def test_manifest_uses_resolved_default_input_paths(tmp_path):
     market = tmp_path / "pre_data" / "continuous_main_tick" / "ag_con_tick.parquet"
-    factor = tmp_path / "factor_data" / "ag_5s" / "ofi_factor_values_keyed.parquet"
+    factor = tmp_path / "factor_data" / "ag" / "l1_imbalance.parquet"
     market.parent.mkdir(parents=True)
     factor.parent.mkdir(parents=True)
     market.write_bytes(b"market")
@@ -89,6 +89,30 @@ def test_manifest_uses_resolved_default_input_paths(tmp_path):
     assert {"market", "factor", "factor_manifest"} <= set(manifest["input_identities"])
     assert manifest["input_identities"]["market"]["resolved_path"] == str(market.resolve())
     assert manifest["input_identities"]["factor"]["resolved_path"] == str(factor.resolve())
+
+def test_manifest_records_actual_output_root(tmp_path):
+    from backtrade.config.schema import BacktradeConfig
+    from backtrade.simulation.compact_v9_runner import CompactV9Result, CompactV9Runner
+    market = tmp_path / "market.parquet"
+    factor = tmp_path / "factor.parquet"
+    market.write_bytes(b"market")
+    factor.write_bytes(b"factor")
+    (tmp_path / "manifest.json").write_text("{}", encoding="utf-8")
+
+    cfg = BacktradeConfig.model_validate(
+        {
+            "initial_cash": 1000,
+            "data": {"product": "ag", "eof_is_day_end": True, "market_path": str(market), "factor_path": str(factor)},
+            "contracts": {},
+        }
+    )
+    runner = CompactV9Runner(cfg, [])
+    result = CompactV9Result([], [], [], [], [], [], [], {"net_qty": {}})
+    output_root = tmp_path / "actual-output"
+
+    manifest = runner._manifest_payload(result, output_root=output_root)
+
+    assert manifest["output_root"] == str(output_root.resolve())
 
 
 def test_maker_audit_excludes_forced_taker_flatten_fills():

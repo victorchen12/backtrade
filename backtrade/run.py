@@ -9,13 +9,15 @@ from backtrade.data.future_l2 import iter_future_l2_ticks
 from backtrade.simulation.compact_v9 import audit_compact_v9
 from backtrade.simulation.compact_v9_runner import CompactV9Runner
 from backtrade.runtime.manifest import payload_digest
+from backtrade.strategies.factors import SUPPORTED_FACTOR_NAMES
 
 
 def _allowed_reset_root(path: Path) -> bool:
     resolved = path.expanduser().resolve(strict=False)
+    # [README-6] reset 只允许清理批准根；普通运行用新的 output_root，不会覆盖已有产物。
     return any(
         resolved == root or root in resolved.parents
-        for root in (Path("/data1/cws/backtrade").resolve(), Path("/tmp").resolve())
+        for root in (Path.cwd().resolve(), Path("/tmp").resolve())
     )
 
 
@@ -29,11 +31,12 @@ def run_from_config(
 ) -> dict[str, Any]:
     if cfg.data.source != "future_l2":
         raise ValueError("compact_v9 requires data.source=future_l2")
-    if cfg.strategy.factor_name != "ofi_cks_best_level_5s" or cfg.strategy.factor_column != "ofi_cks_best_level_5s":
-        raise ValueError("compact_v9 supports only canonical ofi_cks_best_level_5s")
+    if cfg.strategy.factor_name not in SUPPORTED_FACTOR_NAMES or cfg.strategy.factor_column != cfg.strategy.factor_name:
+        raise ValueError(f"compact_v9 does not support factor {cfg.strategy.factor_name}")
     if max_events is not None and int(max_events) <= 0:
         raise ValueError("max_events must be positive when provided")
     cfg.require_contract_for_real_run()
+    # [README-6] 输出目录只接受本次新目录；reset 仅允许清理批准根下的旧目录。
     out = Path(output_root) if output_root is not None else cfg.paths.output_root
     if reset_output and out.exists():
         if not _allowed_reset_root(out):

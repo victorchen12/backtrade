@@ -5,6 +5,7 @@ from typing import Any
 
 import pyarrow.parquet as pq
 
+from backtrade.strategies.factors import SUPPORTED_FACTOR_NAMES
 from backtrade.data.future_l2 import (
     JOIN_KEYS,
     MARKET_COLUMNS,
@@ -15,6 +16,7 @@ from backtrade.data.future_l2 import (
 
 
 def validate_config(cfg) -> dict[str, Any]:
+    # [README-8] validate 只做运行前结构、文件、manifest 和契约检查；通过后才进入回放。
     errors: list[str] = []
     warnings: list[str] = []
     inputs: dict[str, Any] = {}
@@ -23,8 +25,8 @@ def validate_config(cfg) -> dict[str, Any]:
         errors.append("only data.source=future_l2 is supported")
     if cfg.match.mode not in {"maker", "taker"}:
         errors.append("only match.mode=maker or taker is supported")
-    if cfg.strategy.factor_name != "ofi_cks_best_level_5s" or cfg.strategy.factor_column != "ofi_cks_best_level_5s":
-        errors.append("only canonical ofi_cks_best_level_5s is supported")
+    if cfg.strategy.factor_name not in SUPPORTED_FACTOR_NAMES or cfg.strategy.factor_column != cfg.strategy.factor_name:
+        errors.append(f"unsupported factor configuration: {cfg.strategy.factor_name}/{cfg.strategy.factor_column}")
     if cfg.limit_reference.mode == "prev_day_vwap_proxy":
         warnings.append("prev_day_vwap_proxy is an explicit approximation, not an official settlement price")
     if cfg.data.max_ticks is None and not cfg.data.eof_is_day_end:
@@ -43,11 +45,15 @@ def validate_config(cfg) -> dict[str, Any]:
         try:
             schema_names = set(pq.ParquetFile(path).schema.names)
             entry["columns"] = sorted(schema_names)
-            required = set(MARKET_COLUMNS if name == "market" else [*JOIN_KEYS, "part", "split_id", "active_factor", "ofi_cks_best_level_5s"])
+            required = set(MARKET_COLUMNS if name == "market" else ["tick_ts", cfg.strategy.factor_column])
             missing = sorted(required - schema_names)
             if missing:
                 errors.append(f"{name} input is missing columns: {missing}")
             if name == "factor":
+                factor_context = set(JOIN_KEYS) - {"tick_ts"}
+                present_context = factor_context & schema_names
+                if present_context and present_context != factor_context:
+                    errors.append("factor input must contain complete JOIN_KEYS or only tick_ts")
                 _validate_factor_manifest(cfg, path)
         except Exception as exc:
             errors.append(f"{name} input validation failed: {exc}")
@@ -64,7 +70,7 @@ def validate_config(cfg) -> dict[str, Any]:
         "inputs": inputs,
         "source": cfg.data.source,
         "product": cfg.data.product,
-        "strategy_mode": "ofi_sign",
+        "strategy_mode": "signed_factor",
         "factor_name": cfg.strategy.factor_name,
     }
 

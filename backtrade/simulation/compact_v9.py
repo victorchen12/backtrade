@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable
 
+from backtrade.strategies.factors import FACTOR_SEMANTICS
+
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -96,6 +98,7 @@ class CompactV9ParquetOutput:
     streaming = True
 
     def __init__(self, output_root: str | Path, *, maker_enabled: bool = False, batch_size: int = 4096):
+        # [README-6] 写入用户指定的新目录，并在磁盘文件完成后生成最终 manifest。
         self.output_root = Path(output_root)
         self.output_root.mkdir(parents=True, exist_ok=True)
         self.maker_enabled = bool(maker_enabled)
@@ -263,6 +266,67 @@ def _maker_fill_rows(fills: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [row for row in fills if row.get("maker_taker_role") == "maker"]
 
 
+def _audit_signal_execution(activity: list[dict[str, Any]], accounts: list[dict[str, Any]]) -> list[str]:
+    """Check signed-factor targets and ordinary fills against actual single-lot movement."""
+    errors: list[str] = []
+    account_by_fill = {int(row["fill_seq"]): row for row in accounts if row.get("fill_seq") is not None}
+    actual_positions: dict[str, int] = {}
+    latest_targets: dict[str, dict[str, Any]] = {}
+    ordered = sorted(activity, key=lambda row: int(row.get("event_seq") or 0))
+    for row in ordered:
+        product = str(row.get("product") or "").lower()
+        record_type = row.get("record_type")
+        if record_type == "target":
+            current = actual_positions.get(product, 0)
+            score = row.get("factor_score")
+            if bool(row.get("factor_decision")) and score is not None:
+                try:
+                    numeric_score = float(score)
+                except (TypeError, ValueError):
+                    errors.append(f"target {row.get('target_seq')} has a non-numeric factor score")
+                    numeric_score = math.nan
+                if not math.isfinite(numeric_score):
+                    errors.append(f"target {row.get('target_seq')} has a non-finite factor score")
+                else:
+                    if numeric_score > 0:
+                        expected_target = 1 if current >= 0 else 0
+                    elif numeric_score < 0:
+                        expected_target = -1 if current <= 0 else 0
+                    else:
+                        expected_target = current
+                    if row.get("target_qty") != expected_target:
+                        errors.append(f"target {row.get('target_seq')} violates signed factor semantics")
+                source_ts = row.get("factor_source_ts")
+                event_ts = row.get("event_ts")
+                if source_ts is None or event_ts is None or source_ts != event_ts:
+                    errors.append(f"target {row.get('target_seq')} is not an exact factor decision tick")
+                age = row.get("factor_age_ms")
+                if age is None or not math.isclose(float(age), 0.0, rel_tol=0.0, abs_tol=1e-6):
+                    errors.append(f"target {row.get('target_seq')} has non-zero factor age")
+            latest_targets[product] = row
+            continue
+        if record_type != "fill":
+            continue
+        fill_seq = row.get("fill_seq")
+        account = account_by_fill.get(int(fill_seq)) if fill_seq is not None else None
+        if account is None:
+            errors.append(f"fill {fill_seq} has no account row")
+            continue
+        before = int(account.get("position_before") or 0)
+        after = int(account.get("position_after") or 0)
+        boundary = row.get("boundary_reason")
+        target = latest_targets.get(product)
+        if boundary is None:
+            if target is None:
+                errors.append(f"ordinary fill {fill_seq} has no preceding target")
+            else:
+                desired = int(target.get("target_qty") or 0)
+                if abs(desired - after) >= abs(desired - before):
+                    errors.append(f"ordinary fill {fill_seq} does not move toward latest target")
+        actual_positions[product] = after
+    return errors
+
+
 def audit_compact_v9(output_root: str | Path, *, require_fills: bool = False, require_final_flat: bool = False) -> dict[str, Any]:
     root = Path(output_root)
     try:
@@ -285,10 +349,11 @@ def audit_compact_v9(output_root: str | Path, *, require_fills: bool = False, re
         errors.append("snapshot sequence is not monotonic")
     if maker and [row.get("maker_event_seq") for row in maker] != list(range(1, len(maker) + 1)):
         errors.append("maker event sequence is not monotonic")
-    if any(row.get("factor_semantics_version") not in {None, "ofi_sign_v1"} for row in targets):
-        errors.append("target factor semantics is not ofi_sign_v1")
+    if any(row.get("factor_semantics_version") not in {None, *FACTOR_SEMANTICS.values()} for row in targets):
+        errors.append("target factor semantics is unsupported")
     if any(row.get("target_qty") not in {None, -1, 0, 1} for row in targets):
         errors.append("target quantity is outside -1/0/+1")
+    errors.extend(_audit_signal_execution(activity, accounts))
     fill_seqs = [row.get("fill_seq") for row in fills]
     if len(fill_seqs) != len(set(fill_seqs)) or any(value is None for value in fill_seqs):
         errors.append("fill sequence is missing or duplicated")

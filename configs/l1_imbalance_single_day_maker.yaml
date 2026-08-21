@@ -1,0 +1,82 @@
+paths:
+  # [README-2] 所有可写、输入和报告路径集中在此块或 data 路径字段中。
+  project_root: .
+  # [README-2] 当前项目根；不同机器可在 profile 中改写。
+  output_root: ./runs/l1-imbalance-maker
+  # [README-2] 运行产物根目录；可由 --output-root 临时覆盖。
+  future_l2_data_root: ./input
+  # [README-2] HTML 报告根；可改为用户指定的空目录。
+  result_view_root: ./result_view
+
+data:
+  source: future_l2
+  # [README-1] 输入来源固定为 future_l2；市场和因子表头见 README。
+  product: ag
+  split_id: '000'
+  # [README-1] 可选 split；仅筛选输入，不改变原始数据。
+  factor_path: ./input/l1_imbalance.parquet
+  # [README-1] 因子 parquet；需要相邻 manifest.json，并包含 l1_imbalance 列。
+  market_path: ./input/market.parquet
+  parts: [test]
+  trading_days: null
+  # [README-3] 因子源时间与行情时间相等才触发新决策。
+  factor_grid_mode: decision_grid
+  # [README-3] 完整无上限流设置 EOF 日末；有 max_ticks/max-events 的抽样不设日末。
+  eof_is_day_end: true
+
+strategy:
+  # [README-4] 当前策略使用 l1_imbalance 和 signed_factor_v1 的正负号语义。
+  factor_name: l1_imbalance
+  factor_column: l1_imbalance
+
+execution:
+  # [README-5] 决策到订单到达的延迟，单位毫秒。
+  latency_ms: 5
+  # [README-5] 日末窗口，单位毫秒；抽样 EOF 不会被当作日末。
+  day_end_flatten_window_ms: 5000
+
+match:
+  # [README-5] 撮合模式：taker 使用对手 L1，maker 使用严格 MBP expected-queue。
+  mode: maker
+
+limit_reference:
+  mode: disabled
+  # [README-2] 价格限制快照；参考模式必须覆盖实际交易日和合约。
+  snapshot_path: null
+  shfe_new_rule_effective_date: 2026-05-28
+
+risk:
+  max_daily_loss: 1000000
+  max_holding_ms: 86400000
+  stop_on_capital_depleted: true
+  capital_floor: 0
+
+  # [README-2] 初始现金；用于核对 account_ledger 的现金和净 PnL 守恒。
+initial_cash: 1000000
+
+  # [README-2] 合约、费用和价格限制配置；单手模型不模拟保证金或组合持仓。
+contracts:
+  ag:
+    code: AG
+    exchange: SHFE
+    multiplier: 15.0
+    tick_size: 1.0
+    tick_value: 15.0
+    fee:
+      open:
+        mode: rate
+        value: 0.00005
+      close:
+        mode: rate
+        value: 0.00005
+      close_today:
+        mode: rate
+        value: 0.00005
+        contract_overrides:
+          AG2602: 0.00025
+          AG2604: 0.00005
+    price_limit:
+      mode: percent
+      value: 0.20
+      contract_overrides:
+        AG2601: 0.16

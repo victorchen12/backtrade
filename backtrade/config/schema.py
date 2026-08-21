@@ -86,11 +86,16 @@ class ContractRule(BaseModel):
 
 class PathConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    project_root: Path = Path("/home/cws/QUANT/Backtrade")
-    output_root: Path = Path("/data1/cws/backtrade")
-    future_l2_data_root: Path = Path("/data1/cws/future_l2/dataset")
+    # [README-2] 框架根目录；可在 YAML/profile 中选择。
+    project_root: Path = Path(".")
+    # [README-2] 输出 run 目录；可由 run 命令的 --output-root 临时覆盖。
+    output_root: Path = Path("./runs")
+    # [README-2] future_l2 默认数据根；已有数据可直接改用 data.market_path/factor_path。
+    future_l2_data_root: Path = Path("./input")
+    # [README-2] HTML 报告根；每次运行使用新的因子/撮合子目录。
+    result_view_root: Path = Path("./result_view")
 
-    @field_validator("project_root", "output_root", "future_l2_data_root", mode="before")
+    @field_validator("project_root", "output_root", "future_l2_data_root", "result_view_root", mode="before")
     @classmethod
     def expand_path(cls, value: str | Path) -> Path:
         return Path(str(value)).expanduser()
@@ -99,14 +104,19 @@ class PathConfig(BaseModel):
 class DataSourceConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     source: Literal["future_l2"] = "future_l2"
+    # [README-1] 商品代码决定默认市场/因子目录，也用于校验两份输入身份。
     product: str
     split_id: str | None = None
     max_ticks: int | None = Field(default=None, gt=0)
+    # [README-1] L2 市场 parquet；显式路径优先于 future_l2_data_root 推导值。
     market_path: Path | None = None
+    # [README-1] 因子 parquet；相邻 manifest.json 必须绑定市场文件哈希。
     factor_path: Path | None = None
     parts: list[str] = Field(default_factory=lambda: ["test"])
     trading_days: list[str] | None = None
+    # [README-3] 只允许因果 decision_grid；相等时间才触发新因子决策。
     factor_grid_mode: Literal["decision_grid"] = "decision_grid"
+    # [README-3] 完整流 EOF 作为已知日末时设为 true；有上限的抽样保持 end_of_data。
     eof_is_day_end: bool = False
 
     @model_validator(mode="after")
@@ -118,8 +128,15 @@ class DataSourceConfig(BaseModel):
 
 class StrategyConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    factor_name: Literal["ofi_cks_best_level_5s"] = "ofi_cks_best_level_5s"
-    factor_column: Literal["ofi_cks_best_level_5s"] = "ofi_cks_best_level_5s"
+    # [README-4] 当前 v0.1 只支持 L1 盘口量不平衡；两字段必须一致。
+    factor_name: Literal["l1_imbalance"] = "l1_imbalance"
+    factor_column: Literal["l1_imbalance"] = "l1_imbalance"
+
+    @model_validator(mode="after")
+    def validate_factor_pair(self) -> "StrategyConfig":
+        if self.factor_name != self.factor_column:
+            raise ValueError("strategy.factor_name and factor_column must match")
+        return self
 
 
 class RiskConfig(BaseModel):
@@ -132,7 +149,9 @@ class RiskConfig(BaseModel):
 
 class ExecutionConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    # [README-5] 决策到订单到达的延迟，单位为毫秒。
     latency_ms: int = Field(default=5, ge=0)
+    # [README-5] 已知日末前的强制平仓窗口，单位为毫秒；抽样 EOF 不视为日末。
     day_end_flatten_window_ms: int = Field(default=5_000, ge=0)
 
     @property
@@ -142,18 +161,21 @@ class ExecutionConfig(BaseModel):
 
 class MatchConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    # [README-5] 选择 taker 或 maker；两种模式共用策略和账务。
     mode: MatchModeName = "taker"
 
 
 class LimitReferenceConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     mode: LimitReferenceMode = "disabled"
+    # [README-2] 价格限制快照路径；启用参考模式时必须覆盖实际交易日/合约。
     snapshot_path: Path | None = None
     shfe_new_rule_effective_date: date = date(2026, 5, 28)
 
 
 class BacktradeConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    # [README-2] 可改为外部合约 YAML；相对路径相对于主配置文件。
     contract_files: list[Path] = Field(default_factory=list)
     paths: PathConfig = Field(default_factory=PathConfig)
     data: DataSourceConfig
@@ -163,6 +185,7 @@ class BacktradeConfig(BaseModel):
     match: MatchConfig = Field(default_factory=MatchConfig)
     limit_reference: LimitReferenceConfig = Field(default_factory=LimitReferenceConfig)
     contracts: dict[str, ContractRule] = Field(default_factory=dict)
+    # [README-2] 账户初始现金；输出账务以此值核对现金和净 PnL 守恒。
     initial_cash: float
 
     def contract_rule(self, product: str | None = None) -> ContractRule:

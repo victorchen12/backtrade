@@ -1,17 +1,21 @@
-# Contributing
+# 贡献说明
 
-Backtrade changes must preserve the separation between strategy targets,
-execution, matching, accounting, and artifact audit. Add a focused regression
-test before changing core behavior.
+所有核心修改必须保持 Data、Strategy、订单与撮合、Simulation、Accounting 和
+产物审计之间的边界。
 
-From the repository root:
+v0.1 的正式输入路径是 L2 市场快照和 \`l1_imbalance\` 因子。
+因子必须在因果 decision_grid 上对齐，不得读取未来数据。
 
-    python -m backtrade.cli check
-    python -m backtrade.cli validate --config configs/ofi_compact_v9_single_day.yaml
+修改撮合、生命周期或会计逻辑前，先增加针对性回归测试。
+禁止提交真实 parquet、HTML 报告、运行日志、私有 profile 和临时文件。
 
-The supported runtime path is canonical future_l2 market snapshots joined to
-ofi_cks_best_level_5s on a causal decision grid. Do not add synthetic, full-tick,
-external-directional, matrix, or legacy compact branches. Generated parquet,
-logs, profiles with private paths, and temporary files do not belong in commits.
-Every completed run must remain auditable: preserve the fixed compact_v9 schema,
-input identities, final file hashes, latency evidence, and single-lot limits.
+提交前运行：
+
+\`\`\`sh
+python -m pytest --collect-only -q
+python -m pytest -q
+python -m compileall -q backtrade
+git diff --check
+\`\`\`
+
+外部审计目录不属于本仓库。
