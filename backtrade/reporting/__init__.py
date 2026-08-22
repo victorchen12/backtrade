@@ -25,11 +25,19 @@ def generate_backtest_report(
     factor_name: str | None = None,
     mode: str | None = None,
 ) -> dict:
-    data = load_report_data(run_root)
+    run_path = Path(run_root).expanduser().resolve()
+    report_base = Path(result_root).expanduser().resolve()
+    try:
+        report_base.relative_to(run_path)
+    except ValueError:
+        pass
+    else:
+        raise ValueError(f"report root must be separate from run root: {report_base}")
+    data = load_report_data(run_path)
     manifest = data["manifest"]
     factor = _safe_name(factor_name or manifest.get("factor_name") or "factor")
     match_mode = _safe_name(mode or manifest.get("match_mode") or "result")
-    root = Path(result_root).expanduser().resolve() / factor / match_mode
+    root = report_base / factor / match_mode
     # [README-6] 报告写入 result_view_root/因子名/撮合模式；目录非空时拒绝覆盖。
     if root.exists() and any(root.iterdir()):
         raise FileExistsError(f"report directory is not empty and cannot be overwritten: {root}")
@@ -49,7 +57,7 @@ def generate_backtest_report(
     report_manifest = {
         "report_schema_version": "compact_v9_report_v1",
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "run_root": str(Path(run_root).expanduser().resolve()),
+        "run_root": str(run_path),
         "factor_name": factor,
         "match_mode": match_mode,
         "config_digest": manifest.get("config_digest"),
