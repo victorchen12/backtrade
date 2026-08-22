@@ -114,6 +114,8 @@ def _build_figures(data: dict, metrics: dict) -> list[str]:
     market = data.get("market", pd.DataFrame())
     price_basis = str(data.get("price_basis", "raw"))
     price_label = "\u524d\u590d\u6743" if price_basis == "front_adjusted" else "\u539f\u59cb"
+    manifest = data.get("manifest") or {}
+    factor_name = str(manifest.get("factor_name") or "\u56e0\u5b50")
     figures: list[str] = []
 
     if not snapshots.empty:
@@ -172,20 +174,20 @@ def _build_figures(data: dict, metrics: dict) -> list[str]:
             raw_factor = market[["plot_ts", "actual_ts", "active_factor"]].dropna().sort_values("plot_ts")
             if len(raw_factor) > 80_000:
                 raw_factor = raw_factor.iloc[::int(np.ceil(len(raw_factor) / 80_000))]
-            factor_price.add_trace(go.Scatter(x=raw_factor["plot_ts"], y=raw_factor["active_factor"], customdata=_actual_customdata(raw_factor), name="L1 盘口量不平衡", mode="lines", line=dict(color="#90a4ae", width=1), hovertemplate="实际时间=%{customdata}<br>L1=%{y:.6f}<extra></extra>"))
+            factor_price.add_trace(go.Scatter(x=raw_factor["plot_ts"], y=raw_factor["active_factor"], customdata=_actual_customdata(raw_factor), name=f"{factor_name} 因子", mode="lines", line=dict(color="#90a4ae", width=1), hovertemplate=f"实际时间=%{{customdata}}<br>{factor_name}=%{{y:.6f}}<extra></extra>"))
             q10, q90 = raw_factor["active_factor"].quantile([0.10, 0.90]).tolist()
             factor_price.add_hline(y=float(q10), line_dash="dot", line_color="#1976d2", annotation_text="q10", annotation_position="top left")
             factor_price.add_hline(y=float(q90), line_dash="dot", line_color="#ef6c00", annotation_text="q90", annotation_position="bottom left")
         if "factor_q10" in hourly_market:
-            factor_price.add_trace(go.Scatter(x=hourly_market["event_ts"], y=hourly_market["factor_q10"], customdata=_actual_customdata(hourly_market), name="L1 q10（小时）", mode="lines", line=dict(color="#1976d2"), hovertemplate="实际时间=%{customdata}<br>q10=%{y:.6f}<extra></extra>"))
+            factor_price.add_trace(go.Scatter(x=hourly_market["event_ts"], y=hourly_market["factor_q10"], customdata=_actual_customdata(hourly_market), name=f"{factor_name} q10（小时）", mode="lines", line=dict(color="#1976d2"), hovertemplate="实际时间=%{customdata}<br>q10=%{y:.6f}<extra></extra>"))
         if "factor_q90" in hourly_market:
-            factor_price.add_trace(go.Scatter(x=hourly_market["event_ts"], y=hourly_market["factor_q90"], customdata=_actual_customdata(hourly_market), name="L1 q90（小时）", mode="lines", line=dict(color="#ef6c00"), hovertemplate="实际时间=%{customdata}<br>q90=%{y:.6f}<extra></extra>"))
+            factor_price.add_trace(go.Scatter(x=hourly_market["event_ts"], y=hourly_market["factor_q90"], customdata=_actual_customdata(hourly_market), name=f"{factor_name} q90（小时）", mode="lines", line=dict(color="#ef6c00"), hovertemplate="实际时间=%{customdata}<br>q90=%{y:.6f}<extra></extra>"))
         if not market.empty and {"plot_ts", "actual_ts", "front_adjusted_price"}.issubset(market.columns):
             raw_price = market[["plot_ts", "actual_ts", "front_adjusted_price"]].dropna().sort_values("plot_ts")
             if len(raw_price) > 80_000:
                 raw_price = raw_price.iloc[::int(np.ceil(len(raw_price) / 80_000))]
             factor_price.add_trace(go.Scatter(x=raw_price["plot_ts"], y=raw_price["front_adjusted_price"], customdata=_actual_customdata(raw_price), name="实际价格（前复权，tick）", mode="lines", yaxis="y2", line=dict(color="#263238", width=1), hovertemplate="实际时间=%{customdata}<br>前复权价格=%{y:.6f}<extra></extra>"))
-        factor_price.update_layout(title="OOS L1 因子、实际价格与交易活动", xaxis_title="连续交易时间", yaxis=dict(title="因子值"), yaxis2=dict(title="前复权价格", overlaying="y", side="right"), template="plotly_white", height=420, margin=dict(l=55, r=65, t=55, b=45))
+        factor_price.update_layout(title=f"OOS {factor_name} 因子、实际价格与交易活动", xaxis_title="连续交易时间", yaxis=dict(title="因子值"), yaxis2=dict(title="前复权价格", overlaying="y", side="right"), template="plotly_white", height=420, margin=dict(l=55, r=65, t=55, b=45))
         _set_time_axis(factor_price, market if not market.empty else hourly_market)
         if price_basis != "front_adjusted":
             for trace in factor_price.data:

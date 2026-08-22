@@ -9,5 +9,6 @@ paths:
 data:
   # 也可以在命令行用 --market-path/--factor-path 覆盖。
   market_path: ./input/market.parquet
+  # 示例因子；若使用自定义因子，需在主 YAML 同步设置 strategy.factor_name 和 strategy.factor_column。
   factor_path: ./input/l1_imbalance.parquet
   product: ag

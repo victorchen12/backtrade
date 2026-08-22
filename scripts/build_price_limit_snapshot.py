@@ -11,6 +11,7 @@ import shutil
 from pathlib import Path
 
 import pandas as pd
+import pyarrow.parquet as pq
 
 from backtrade.config.loader import load_config
 from backtrade.data.limit_reference import (
@@ -26,6 +27,56 @@ def _sha256(path: Path) -> str:
             digest.update(block)
     return digest.hexdigest()
 
+_FACTOR_CONTEXT_COLUMNS = frozenset({"product", "trading_day", "session_id", "underlying_secu_cd"})
+
+
+def _load_factor_keys(factor_path: Path, market_path: Path) -> pd.DataFrame:
+    """Return trading-day/contract keys for full-context or minimal factor parquet."""
+    factor_names = set(pq.ParquetFile(factor_path).schema.names)
+    if "tick_ts" not in factor_names:
+        raise ValueError("factor parquet requires tick_ts")
+    present_context = _FACTOR_CONTEXT_COLUMNS & factor_names
+    if present_context and present_context != _FACTOR_CONTEXT_COLUMNS:
+        raise ValueError("factor context columns must be complete JOIN_KEYS or omitted")
+    if present_context == _FACTOR_CONTEXT_COLUMNS:
+        keys = pd.read_parquet(
+            factor_path,
+            columns=["trading_day", "underlying_secu_cd"],
+        )
+    else:
+        factor_ticks = pd.read_parquet(factor_path, columns=["tick_ts"])
+        market_context = pd.read_parquet(
+            market_path,
+            columns=["tick_ts", "trading_day", "underlying_secu_cd"],
+        )
+        factor_ticks["tick_ts"] = pd.to_datetime(factor_ticks["tick_ts"], errors="raise")
+        market_context["tick_ts"] = pd.to_datetime(market_context["tick_ts"], errors="raise")
+        if factor_ticks["tick_ts"].duplicated().any():
+            raise ValueError("factor parquet contains duplicate tick_ts")
+        if market_context["tick_ts"].duplicated().any():
+            raise ValueError("minimal factor tick_ts does not uniquely identify a market tick")
+        keys = factor_ticks.merge(
+            market_context,
+            on="tick_ts",
+            how="left",
+            validate="one_to_one",
+        ).drop(columns=["tick_ts"])
+        if keys[["trading_day", "underlying_secu_cd"]].isna().any().any():
+            raise ValueError("minimal factor tick_ts does not match a market tick")
+    if keys.empty:
+        raise ValueError("factor parquet has no rows")
+    if keys[["trading_day", "underlying_secu_cd"]].isna().any().any():
+        raise ValueError("factor key columns cannot contain null values")
+    return (
+        keys.assign(
+            trading_day=keys["trading_day"].astype(str),
+            contract=keys["underlying_secu_cd"].astype(str).str.upper(),
+        )[["trading_day", "contract"]]
+        .drop_duplicates()
+        .sort_values(["trading_day", "contract"], kind="mergesort")
+        .reset_index(drop=True)
+    )
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -39,19 +90,7 @@ def main() -> int:
     cfg = load_config(args.config)
     if not args.factor_path.is_file() or not args.market_path.is_file():
         raise FileNotFoundError("factor and market paths must exist")
-    factor_keys = pd.read_parquet(
-        args.factor_path,
-        columns=["trading_day", "underlying_secu_cd"],
-    )
-    targets = (
-        factor_keys.assign(
-            trading_day=factor_keys["trading_day"].astype(str),
-            contract=factor_keys["underlying_secu_cd"].astype(str).str.upper(),
-        )[["trading_day", "contract"]]
-        .drop_duplicates()
-        .sort_values(["trading_day", "contract"], kind="mergesort")
-        .reset_index(drop=True)
-    )
+    targets = _load_factor_keys(args.factor_path, args.market_path)
     references = load_prev_day_vwap_limit_references(
         args.market_path,
         cfg.contracts,

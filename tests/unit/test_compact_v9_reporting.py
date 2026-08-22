@@ -132,3 +132,45 @@ def test_report_display_formats_net_return_as_percent():
 
     assert _display_value("净收益率", 0.0125) == "1.25%"
     assert _display_value("净 PnL", 1.25) == "1.25"
+
+def test_report_factor_chart_uses_configured_factor_name():
+    from backtrade.reporting.html import _build_figures
+
+    market = pd.DataFrame(
+        {
+            "plot_ts": pd.to_datetime(["2000-01-01 00:00:00", "2000-01-01 00:01:00"]),
+            "actual_ts": pd.to_datetime(["2026-01-05 09:00:00", "2026-01-05 09:01:00"]),
+            "active_factor": [0.2, -0.1],
+            "front_adjusted_price": [100.0, 101.0],
+        }
+    )
+    hourly_market = pd.DataFrame(
+        {
+            "event_ts": pd.to_datetime(["2000-01-01 00:01:00"]),
+            "actual_ts": pd.to_datetime(["2026-01-05 09:01:00"]),
+            "trading_day": ["2026-01-05"],
+            "price": [101.0],
+            "factor_q10": [-0.05],
+            "factor_q90": [0.15],
+            "volume": [2.0],
+        }
+    )
+    figures = _build_figures(
+        {
+            "manifest": {"factor_name": "my_ofi"},
+            "market": market,
+            "snapshots": pd.DataFrame(),
+            "activity": pd.DataFrame(),
+            "accounts": pd.DataFrame(),
+            "hourly_market": hourly_market,
+            "hourly_drawdown": pd.DataFrame(),
+            "price_basis": "raw",
+        },
+        {},
+    )
+
+    assert len(figures) == 2
+    assert "my_ofi" in figures[0]
+    assert "L1 盘口量不平衡" not in figures[0]
+    assert "L1 q10" not in figures[0]
+    assert "L1 q90" not in figures[0]

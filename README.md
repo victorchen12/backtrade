@@ -21,37 +21,37 @@ Maker 使用保守的 MBP expected-queue 估计。
 
 市场文件必须是 parquet，至少包含：
 
-\`\`\`text
+```text
 trading_day, session_id, tick_ts, underlying_secu_cd,
 last_prc, vol_inc, amt_inc,
 bid1_prc, bid2_prc, bid3_prc, bid4_prc, bid5_prc,
 ask1_prc, ask2_prc, ask3_prc, ask4_prc, ask5_prc,
 bid1_qty, bid2_qty, bid3_qty, bid4_qty, bid5_qty,
 ask1_qty, ask2_qty, ask3_qty, ask4_qty, ask5_qty
-\`\`\`
+```
 
-\`product\` 可以省略，由 YAML 的 \`data.product\` 补齐。
+`product` 可以省略，由 YAML 的 `data.product` 补齐。
 价格必须有限且符合盘口单调性；数量必须非负。
-\`last_prc_adj\` 和 \`adj_factor\` 只用于报告展示，不改变成交和账务价格。
+`last_prc_adj` 和 `adj_factor` 只用于报告展示，不改变成交和账务价格。
 
 ### 1.2 因子文件
 
 因子列名由 YAML 的 strategy.factor_column 指定。名称只允许英文字母、数字、点、下划线和连字符，
 且不能使用 tick_ts、product、active_factor 等框架保留列名。已有因子文件至少包含：
 
-\`\`\`text
+```text
 tick_ts, <your_factor_name>
-\`\`\`
+```
 
 也可以提供完整上下文：
 
-\`\`\`text
+```text
 product, trading_day, session_id, underlying_secu_cd,
 tick_ts, <your_factor_name>
-\`\`\`
+```
 
-\`tick_ts\` 必须唯一，并且必须对应市场快照中的实际 tick。
-因子文件同目录必须有 \`manifest.json\`，其中绑定因子哈希、市场哈希、
+`tick_ts` 必须唯一，并且必须对应市场快照中的实际 tick。
+因子文件同目录必须有 `manifest.json`，其中绑定因子哈希、市场哈希、
 商品和实际配置的 factor_columns 列表。
 
 ### 1.3 内置 L1 因子（可选）
@@ -59,11 +59,11 @@ tick_ts, <your_factor_name>
 这是框架内置的示例派生方式；自定义因子必须由用户先计算并写入因子 parquet，
 框架不会根据因子名称猜测或重算用户算法。
 
-\`l1_imbalance\` 的定义是：
+`l1_imbalance` 的定义是：
 
-\`\`\`text
+```text
 (bid1_qty - ask1_qty) / (bid1_qty + ask1_qty)
-\`\`\`
+```
 
 当买一和卖一数量都为零时，结果为 0。
 只使用当前 tick 的买一和卖一数量，不读取未来行情。
@@ -72,22 +72,22 @@ tick_ts, <your_factor_name>
 
 建议仓库外准备输入目录：
 
-\`\`\`text
+```text
 input/
 ├── market.parquet
 └── <your_factor_name>.parquet
-\`\`\`
+```
 
 也可以直接在命令行传入任意文件路径。
-推荐从 \`configs/l1_imbalance_single_day_taker.yaml\` 或
-\`configs/l1_imbalance_single_day_maker.yaml\` 复制配置。
+推荐从 `configs/l1_imbalance_single_day_taker.yaml` 或
+`configs/l1_imbalance_single_day_maker.yaml` 复制配置。
 
 关键字段：
 
-\`\`\`yaml
+```yaml
 paths:
   project_root: .
-  output_root: ./runs/l1-imbalance-taker
+  output_root: ./runs/my-ofi-taker
   future_l2_data_root: ./input
   result_view_root: ./result_view
 
@@ -104,25 +104,29 @@ strategy:
 
 match:
   mode: taker
-\`\`\`
+```
 
-\`run --market-path\` 和 \`run --factor-path\` 会覆盖 YAML 中的路径。
+`strategy.factor_name` 和 `strategy.factor_column` 必须使用同一个用户因子名；
+示例配置中的 `l1_imbalance` 只是内置 L1 示例。复制配置后，同时修改这两个字段、
+`data.factor_path` 和输出目录，再运行校验和回测。
+
+`run --market-path` 和 `run --factor-path` 会覆盖 YAML 中的路径。
 输出目录和报告目录必须是新的空目录，框架拒绝覆盖已有产物。
 
 ## 3. 数据回放和因子对齐
 
 Data 层先校验市场、因子和 manifest 身份，再执行因果
-\`decision_grid\` backward as-of join。
+`decision_grid` backward as-of join。
 
-只有因子源 tick 设置 \`factor_decision=true\`。
+只有因子源 tick 设置 `factor_decision=true`。
 中间行情只携带最近一个已完成的因子值，不会使用未来因子。
 
-完整未截断的数据流需要设置 \`eof_is_day_end: true\`。
-如果使用 \`--max-events\` 或 \`max_ticks\`，末尾只视为 \`end_of_data\`。
+完整未截断的数据流需要设置 `eof_is_day_end: true`。
+如果使用 `--max-events` 或 `max_ticks`，末尾只视为 `end_of_data`。
 
 ## 4. 策略和信号
 
-当前策略语义为 \`signed_factor_v1\`：
+当前策略语义为 `signed_factor_v1`：
 
 - 因子大于 0：目标持有一手多头；
 - 因子小于 0：目标持有一手空头；
@@ -149,27 +153,27 @@ Maker 规则：
 
 成交是唯一账务事件。
 
-开仓成交的逐行 \`net_pnl\` 为 \`-open_fee\`。
-平仓成交的逐行 \`net_pnl\` 为 \`gross_pnl-close_fee\`。
+开仓成交的逐行 `net_pnl` 为 `-open_fee`。
+平仓成交的逐行 `net_pnl` 为 `gross_pnl-close_fee`。
 
 必须满足：
 
-\`\`\`text
+```text
 sum(net_pnl) = final_cash - initial_cash
 sum(net_pnl) = realized_pnl - total_fee
-\`\`\`
+```
 
 运行目录包含：
 
-\`\`\`text
+```text
 activity_ledger.parquet
 account_ledger.parquet
 state_snapshots.parquet
 maker_events.parquet  # 仅 Maker
 manifest.json
-\`\`\`
+```
 
-\`inspect\` 会校验 manifest、parquet schema、文件哈希、成交时序、
+`inspect` 会校验 manifest、parquet schema、文件哈希、成交时序、
 现金和 PnL 守恒以及最终空仓。
 审计通过后才生成 HTML 报告。
 
@@ -177,13 +181,13 @@ manifest.json
 
 进入仓库根目录：
 
-\`\`\`sh
+```sh
 cd /path/to/Backtrade
-\`\`\`
+```
 
 只有市场快照时：
 
-\`\`\`sh
+```sh
 python -m backtrade.cli derive-factor \
   --product ag \
   --market-path /data/team/market.parquet \
@@ -194,62 +198,69 @@ python -m backtrade.cli prepare-input \
   --market-path /data/team/market.parquet \
   --factor-path /data/team/l1_imbalance.parquet \
   --factor-column l1_imbalance
-\`\`\`
+```
 
-已有两份输入时，直接执行 \`prepare-input\` 即可。
+已有两份输入时，直接执行 `prepare-input` 即可。
 
 先校验：
 如果使用自定义因子，例如列名 my_ofi：
 
-\`\`\`sh
+```sh
 python -m backtrade.cli prepare-input \
   --product ag \
   --market-path /data/team/market.parquet \
   --factor-path /data/team/my_ofi.parquet \
   --factor-column my_ofi
-\`\`\`
+```
 
 同时把 YAML 的 strategy.factor_name 和 strategy.factor_column 都改为 my_ofi，
 并把下面命令中的 --factor-path 替换为 /data/team/my_ofi.parquet，再执行 validate 和 run。
+建议先复制示例配置为团队自己的文件，例如
+`configs/my_ofi_single_day_taker.yaml`，并同步修改其中的因子路径、因子名和输出目录。
 
-\`\`\`sh
+```sh
 python -m backtrade.cli validate \
-  --config configs/l1_imbalance_single_day_taker.yaml \
+  --config configs/my_ofi_single_day_taker.yaml \
   --market-path /data/team/market.parquet \
-  --factor-path /data/team/l1_imbalance.parquet \
+  --factor-path /data/team/my_ofi.parquet \
   --trading-days 2026-01-05 2026-01-06 2026-01-07
-\`\`\`
+```
 
 运行 Taker：
 
-\`\`\`sh
+```sh
 python -m backtrade.cli run \
-  --config configs/l1_imbalance_single_day_taker.yaml \
+  --config configs/my_ofi_single_day_taker.yaml \
   --market-path /data/team/market.parquet \
-  --factor-path /data/team/l1_imbalance.parquet \
+  --factor-path /data/team/my_ofi.parquet \
   --trading-days 2026-01-05 2026-01-06 2026-01-07 \
-  --output-root /data/team/runs/l1-taker \
-  --result-view-root /data/team/result_view/l1-taker
-\`\`\`
+  --output-root /data/team/runs/my-ofi-taker \
+  --result-view-root /data/team/result_view/my-ofi-taker
+```
 
 运行 Maker 时只替换配置文件：
 
-\`\`\`sh
+```sh
 python -m backtrade.cli run \
-  --config configs/l1_imbalance_single_day_maker.yaml \
+  --config configs/my_ofi_single_day_maker.yaml \
   --market-path /data/team/market.parquet \
-  --factor-path /data/team/l1_imbalance.parquet \
+  --factor-path /data/team/my_ofi.parquet \
   --trading-days 2026-01-05 2026-01-06 2026-01-07 \
-  --output-root /data/team/runs/l1-maker \
-  --result-view-root /data/team/result_view/l1-maker
-\`\`\`
+  --output-root /data/team/runs/my-ofi-maker \
+  --result-view-root /data/team/result_view/my-ofi-maker
+```
 
 检查产物：
 
-\`\`\`sh
+```sh
 python -m backtrade.cli inspect \
-  --run /data/team/runs/l1-taker
-\`\`\`
+  --run /data/team/runs/my-ofi-taker
+```
+
+启用 `limit_reference.mode: prev_day_vwap_proxy` 或 `official` 时，可运行
+`scripts/build_price_limit_snapshot.py` 生成价格限制快照。脚本支持最简因子
+`tick_ts + 因子列`，会从 market parquet 补齐交易日和合约；完整上下文因子也可直接使用。
+价格限制快照必须覆盖实际回测的每个交易日和合约，`prev_day_vwap_proxy` 只是近似参考价。
 
 ## 8. 发布和验收边界
 
@@ -260,8 +271,8 @@ v0.1.0 是首个团队内部可用版本，不代表接口已经稳定到 v1.0�
 
 - 输入市场和因子属于同一商品、合约和交易日期；
 - 因子 manifest 的市场哈希和因子哈希通过；
-- \`validate\` 通过；
-- \`run\` 返回 audit passed；
-- \`inspect\` 显示最终空仓；
+- `validate` 通过；
+- `run` 返回 audit passed；
+- `inspect` 显示最终空仓；
 - HTML、manifest 和 parquet 文件都存在；
 - 真实数据和运行产物没有进入 Git 仓库。

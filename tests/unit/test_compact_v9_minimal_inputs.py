@@ -162,3 +162,18 @@ def test_legacy_manifest_without_market_hash_requires_exact_market_path(tmp_path
     _validate_factor_manifest(_manifest_config(market_a, factor), factor)
     with pytest.raises(ValueError, match="market.*path"):
         _validate_factor_manifest(_manifest_config(market_b, factor), factor)
+
+def test_price_limit_snapshot_keys_accept_minimal_factor_input(tmp_path):
+    from scripts.build_price_limit_snapshot import _load_factor_keys
+
+    market = _market_frame()
+    market_path = tmp_path / "market.parquet"
+    factor_path = tmp_path / "my_ofi.parquet"
+    market.to_parquet(market_path, index=False)
+    pd.DataFrame({"tick_ts": [pd.Timestamp(TS)], "my_ofi": [0.25]}).to_parquet(factor_path, index=False)
+
+    keys = _load_factor_keys(factor_path, market_path)
+
+    assert keys.to_dict("records") == [
+        {"trading_day": "2026-01-05", "contract": "AG2604"}
+    ]

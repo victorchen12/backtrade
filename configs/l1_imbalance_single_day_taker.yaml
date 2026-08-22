@@ -15,17 +15,17 @@ data:
   split_id: '000'
   # [README-1] 可选 split；仅筛选输入，不改变原始数据。
   factor_path: ./input/l1_imbalance.parquet
-  # [README-1] 因子 parquet；需要相邻 manifest.json，并包含 l1_imbalance 列。
+  # [README-1] 这是 L1 示例；自定义因子需同步修改 factor_path、strategy.factor_name 和 strategy.factor_column。
   market_path: ./input/market.parquet
   parts: [test]
   trading_days: null
   # [README-3] 因子源时间与行情时间相等才触发新决策。
   factor_grid_mode: decision_grid
-  # [README-3] 完整无上限流设置 EOF 日末；有 max_ticks/max-events 的抽样不设日末。
+  # [README-3] 完整无上限流设置 EOF 日末；有 max_ticks 或 --max-events 的抽样不设日末。
   eof_is_day_end: true
 
 strategy:
-  # [README-4] 当前策略使用 l1_imbalance 和 signed_factor_v1 的正负号语义。
+  # [README-4] 这是 L1 示例；用户因子名由 factor_name/factor_column 配置，正负号仍按 signed_factor_v1 解释。
   factor_name: l1_imbalance
   factor_column: l1_imbalance
 
