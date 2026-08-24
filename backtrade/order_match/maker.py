@@ -233,6 +233,12 @@ class MakerMatcher:
             order.queue_reference_qty = visible
             return [], [self._event(order, view, "rebaseline", "maker_invalid_observation", before, before, depth_before=current_visible, depth_after=current_visible)]
 
+        if current_visible <= 0:
+            before = state.queue_ahead
+            self._cancel(order, "maker_invalid_l1", view)
+            self.retire_order(order.order_id)
+            return [], [self._event(order, view, "cancel", "maker_invalid_l1", before, None, depth_before=state.previous_visible, depth_after=current_visible)]
+
         high = self._high_confidence_opposite(order, view)
         observed_trade_qty = max(int(view.vol_inc), 0)
         strict_through = high and observed_trade_qty > 0 and view.last_price is not None and (

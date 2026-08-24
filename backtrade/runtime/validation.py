@@ -3,8 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import pyarrow.parquet as pq
-
 from backtrade.strategies.factors import validate_factor_name
 from backtrade.data.future_l2 import (
     JOIN_KEYS,
@@ -13,10 +11,11 @@ from backtrade.data.future_l2 import (
     processed_market_path,
     selected_factor_screen_path,
 )
+from backtrade.data.tabular import table_columns
 
 
 def validate_config(cfg) -> dict[str, Any]:
-    # [README-8] validate 只做运行前结构、文件、manifest 和契约检查；通过后才进入回放。
+    # [README-7] validate 只做运行前结构、文件、manifest 和契约检查；通过后才进入回放。
     errors: list[str] = []
     warnings: list[str] = []
     inputs: dict[str, Any] = {}
@@ -47,7 +46,7 @@ def validate_config(cfg) -> dict[str, Any]:
             errors.append(f"{name} input does not exist: {path}")
             continue
         try:
-            schema_names = set(pq.ParquetFile(path).schema.names)
+            schema_names = set(table_columns(path))
             entry["columns"] = sorted(schema_names)
             required = set(MARKET_COLUMNS if name == "market" else ["tick_ts", cfg.strategy.factor_column])
             missing = sorted(required - schema_names)

@@ -16,6 +16,7 @@ from backtrade.data.limit_reference import (
     load_price_limit_reference_snapshot,
 )
 from backtrade.data.market_quality import derive_market_quality_flags
+from backtrade.data.tabular import read_table, resolve_table_candidate, table_columns, table_format
 from backtrade.simulation.events import MarketTick
 from backtrade.strategies.factors import L1_IMBALANCE_NAME, validate_factor_name
 from backtrade.simulation.state import OrderSide
@@ -48,14 +49,20 @@ def processed_market_path(cfg: BacktradeConfig) -> Path:
     # [README-1] 数据输入路径：显式 market_path 优先，否则按 future_l2_data_root 推导。
     if cfg.data.market_path is not None:
         return Path(cfg.data.market_path)
-    return cfg.paths.future_l2_data_root / "pre_data" / "continuous_main_tick" / f"{cfg.data.product}_con_tick.parquet"
+    return resolve_table_candidate(
+        cfg.paths.future_l2_data_root / "pre_data" / "continuous_main_tick",
+        f"{cfg.data.product}_con_tick",
+    )
 
 
 def selected_factor_screen_path(cfg: BacktradeConfig) -> Path:
     # [README-1] 因子输入路径：显式 factor_path 优先，manifest.json 与其同目录。
     if cfg.data.factor_path is not None:
         return Path(cfg.data.factor_path)
-    return cfg.paths.future_l2_data_root / "factor_data" / str(cfg.data.product).lower() / f"{cfg.strategy.factor_column}.parquet"
+    return resolve_table_candidate(
+        cfg.paths.future_l2_data_root / "factor_data" / str(cfg.data.product).lower(),
+        cfg.strategy.factor_column,
+    )
 
 
 def factor_grid_mode(cfg: BacktradeConfig) -> str:
@@ -84,7 +91,7 @@ def _require_keys(frame: pd.DataFrame, name: str) -> None:
 
 
 def enrich_factor_keys(market: pd.DataFrame, factors: pd.DataFrame, *, factor_name: str = FACTOR_NAME) -> pd.DataFrame:
-    """Attach market context to a minimal ``tick_ts``/factor parquet.
+    """Attach market context to a minimal ``tick_ts``/factor input.
 
     A minimal factor file is deliberately exact-tick keyed.  If a timestamp
     maps to more than one market row, the input is ambiguous and is rejected
@@ -93,7 +100,7 @@ def enrich_factor_keys(market: pd.DataFrame, factors: pd.DataFrame, *, factor_na
 
     factor_name = validate_factor_name(factor_name)
     if "tick_ts" not in factors.columns or factor_name not in factors.columns:
-        raise KeyError(f"minimal factor parquet requires tick_ts and {factor_name}")
+        raise KeyError(f"minimal factor input requires tick_ts and {factor_name}")
     context_keys = set(JOIN_KEYS) - {"tick_ts"}
     partial = context_keys & set(factors.columns)
     if partial and partial != context_keys:
@@ -138,7 +145,7 @@ def merge_market_and_factors(market: pd.DataFrame, factors: pd.DataFrame, *, fac
     if right.duplicated(JOIN_KEYS).any():
         raise ValueError("duplicate factor JOIN_KEYS")
     if factor_name not in right.columns:
-        raise KeyError(f"factor parquet is missing {factor_name}")
+        raise KeyError(f"factor input is missing {factor_name}")
     if "active_factor" not in right.columns:
         right["active_factor"] = right[factor_name].astype(float)
     factor_cols = [column for column in ("active_factor", factor_name) if column in right.columns]
@@ -183,16 +190,16 @@ def _validate_factor_manifest(cfg: BacktradeConfig, factor_path: Path) -> dict:
         raise ValueError(f"factor manifest must expose only {factor_name}")
     expected_hash = manifest.get("factor_values_sha256")
     if not isinstance(expected_hash, str) or _sha256(factor_path) != expected_hash:
-        raise ValueError("canonical factor parquet hash does not match adjacent manifest")
+        raise ValueError("canonical factor input hash does not match adjacent manifest")
     declared_path = manifest.get("factor_values_keyed_path") or manifest.get("factor_values_path")
     if declared_path and Path(declared_path).name != factor_path.name:
-        raise ValueError("canonical factor manifest points to a different parquet")
+        raise ValueError("canonical factor manifest points to a different input")
     declared_product = manifest.get("product")
     if declared_product is not None and str(declared_product).lower() != str(cfg.data.product).lower():
         raise ValueError("canonical factor manifest product does not match configured product")
     market_path = processed_market_path(cfg).expanduser().resolve()
     if not market_path.is_file():
-        raise FileNotFoundError(f"configured market parquet is missing: {market_path}")
+        raise FileNotFoundError(f"configured market input is missing: {market_path}")
     declared_market = manifest.get("market_path")
     declared_market_hash = manifest.get("market_sha256")
     if declared_market_hash is not None:
@@ -214,21 +221,20 @@ def _validate_factor_manifest(cfg: BacktradeConfig, factor_path: Path) -> dict:
 def load_factor_frame_for_split(cfg: BacktradeConfig, nrows: int | None = None) -> pd.DataFrame:
     path = selected_factor_screen_path(cfg)
     if not path.is_file():
-        raise FileNotFoundError(f"canonical factor parquet is missing: {path}")
+        raise FileNotFoundError(f"canonical factor input is missing: {path}")
     _validate_factor_manifest(cfg, path)
-    parquet = pq.ParquetFile(path)
-    names = set(parquet.schema.names)
+    names = set(table_columns(path))
     factor_name = cfg.strategy.factor_column
     required = {"tick_ts", factor_name}
     missing = sorted(required - names)
     if missing:
-        raise KeyError(f"canonical factor parquet is missing columns: {missing}")
+        raise KeyError(f"canonical factor input is missing columns: {missing}")
     has_context = set(JOIN_KEYS).issubset(names)
     partial_context = (set(JOIN_KEYS) - {"tick_ts"}) & names
     if partial_context and not has_context:
         raise ValueError("factor context columns must be complete JOIN_KEYS or omitted")
     columns = [column for column in ["part", "split_id", *JOIN_KEYS, "active_factor", factor_name, "factor_decision", "factor_source_ts", "factor_age_ms"] if column in names]
-    frame = pd.read_parquet(path, columns=columns)
+    frame = read_table(path, columns=columns)
     if cfg.data.parts and "part" in frame:
         frame = frame[frame["part"].astype(str).isin({str(value) for value in cfg.data.parts})]
     if cfg.data.split_id is not None and "split_id" in frame:
@@ -243,7 +249,7 @@ def load_factor_frame_for_split(cfg: BacktradeConfig, nrows: int | None = None) 
     if has_context:
         frame = _clean_keys(frame)
         if frame.duplicated(JOIN_KEYS).any():
-            raise ValueError("canonical factor parquet contains duplicate JOIN_KEYS")
+            raise ValueError("canonical factor input contains duplicate JOIN_KEYS")
     elif frame.duplicated(["tick_ts"]).any():
         raise ValueError("duplicate factor tick_ts")
     if "product" in frame and (frame["product"].astype(str).str.lower() != str(cfg.data.product).lower()).any():
@@ -272,23 +278,32 @@ def _row_groups_for_days(parquet: pq.ParquetFile, days: set[str]) -> list[int]:
 
 
 def _read_market(path: Path, days: set[str], *, product: str, tick_size: float) -> pd.DataFrame:
-    parquet = pq.ParquetFile(path)
-    missing = sorted(set(MARKET_COLUMNS) - set(parquet.schema.names))
+    table_kind = table_format(path)
+    names = set(table_columns(path))
+    missing = sorted(set(MARKET_COLUMNS) - names)
     if missing:
-        raise KeyError(f"market parquet is missing columns: {missing}")
-    columns = [column for column in [*MARKET_COLUMNS, *MARKET_OPTIONAL_COLUMNS] if column in parquet.schema.names]
+        raise KeyError(f"market input is missing columns: {missing}")
+    columns = [column for column in [*MARKET_COLUMNS, *MARKET_OPTIONAL_COLUMNS] if column in names]
     frames = []
-    offset = 0
-    selected = set(_row_groups_for_days(parquet, days))
-    for group in range(parquet.num_row_groups):
-        count = parquet.metadata.row_group(group).num_rows
-        if group in selected:
-            frame = parquet.read_row_group(group, columns=columns).to_pandas()
-            frame["source_seq"] = np.arange(offset, offset + count, dtype="int64")
-            if days:
-                frame = frame[frame["trading_day"].astype(str).isin(days)]
-            frames.append(frame)
-        offset += count
+    if table_kind == "parquet":
+        parquet = pq.ParquetFile(path)
+        offset = 0
+        selected = set(_row_groups_for_days(parquet, days))
+        for group in range(parquet.num_row_groups):
+            count = parquet.metadata.row_group(group).num_rows
+            if group in selected:
+                frame = parquet.read_row_group(group, columns=columns).to_pandas()
+                frame["source_seq"] = np.arange(offset, offset + count, dtype="int64")
+                if days:
+                    frame = frame[frame["trading_day"].astype(str).isin(days)]
+                frames.append(frame)
+            offset += count
+    else:
+        frame = read_table(path, columns=columns)
+        frame["source_seq"] = np.arange(len(frame), dtype="int64")
+        if days:
+            frame = frame[frame["trading_day"].astype(str).isin(days)]
+        frames.append(frame)
     if not frames:
         return pd.DataFrame(columns=[*MARKET_COLUMNS, "product", "source_seq"])
     out = pd.concat(frames, ignore_index=True)
@@ -397,7 +412,7 @@ def iter_future_l2_ticks(cfg: BacktradeConfig, max_events: int | None = None, ba
         raise ValueError("batch_size must be positive")
     market_path = processed_market_path(cfg)
     if not market_path.is_file():
-        raise FileNotFoundError(f"market parquet is missing: {market_path}")
+        raise FileNotFoundError(f"market input is missing: {market_path}")
     factors = load_factor_frame_for_split(cfg)
     days = set(factors["trading_day"].astype(str)) if "trading_day" in factors else set(cfg.data.trading_days or [])
     market = _read_market(market_path, days, product=cfg.data.product, tick_size=float(cfg.contract_rule().tick_size))

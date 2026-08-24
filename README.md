@@ -1,25 +1,23 @@
 # Backtrade v0.1.0
 
-Backtrade 是面向期货 L2 盘口快照的确定性模拟交易回测框架。
-v0.1 支持用户配置的单个有符号时间序列因子、单品种、单手、
+Backtrade 是面向期货 L2 盘口快照的模拟交易回测框架。
+v0.1 支持单个有符号时序因子、单品种、单手、
 Taker 和 Maker 两种撮合模式。
 
 ## 使用边界
 
 当前版本不模拟多手、保证金、组合持仓、交易所 FIFO 重建或官方结算价。
-Maker 使用保守的 MBP expected-queue 估计。
-价格限制可以关闭，也可以由使用者提供明确的参考快照。
 
-路径可以在 YAML、profile 或命令行中修改。
+路径可在 YAML、profile 或命令行中指定。
 代码中的 [README-n] 注释用于定位本文对应章节。
 
 ## 1. 输入文件和表头
 
-一次回测可以使用市场快照加已有因子，也可以只使用市场快照后现场生成因子。
+回测需要市场快照和因子表。只有市场快照时，可先用 CLI 生成内置 L1 因子。
 
 ### 1.1 市场快照
 
-市场文件必须是 parquet，至少包含：
+市场文件支持 Parquet、CSV/CSV.GZ 或 Feather，至少包含：
 
 ```text
 trading_day, session_id, tick_ts, underlying_secu_cd,
@@ -31,13 +29,11 @@ ask1_qty, ask2_qty, ask3_qty, ask4_qty, ask5_qty
 ```
 
 `product` 可以省略，由 YAML 的 `data.product` 补齐。
-价格必须有限且符合盘口单调性；数量必须非负。
 `last_prc_adj` 和 `adj_factor` 只用于报告展示，不改变成交和账务价格。
 
 ### 1.2 因子文件
 
-因子列名由 YAML 的 strategy.factor_column 指定。名称只允许英文字母、数字、点、下划线和连字符，
-且不能使用 tick_ts、product、active_factor 等框架保留列名。已有因子文件至少包含：
+因子列名由 YAML 的 strategy.factor_column 指定。名称不接受中文。已有因子文件至少包含：
 
 ```text
 tick_ts, <your_factor_name>
@@ -51,12 +47,11 @@ tick_ts, <your_factor_name>
 ```
 
 `tick_ts` 必须唯一，并且必须对应市场快照中的实际 tick。
-因子文件同目录必须有 `manifest.json`，其中绑定因子哈希、市场哈希、
-商品和实际配置的 factor_columns 列表。
+因子文件同目录必须有 `manifest.json`。
 
 ### 1.3 内置 L1 因子（可选）
 
-这是框架内置的示例派生方式；自定义因子必须由用户先计算并写入因子 parquet，
+这是框架内置的示例派生方式；自定义因子必须由用户先计算并写入因子表格文件，
 框架不会根据因子名称猜测或重算用户算法。
 
 `l1_imbalance` 的定义是：
@@ -65,20 +60,18 @@ tick_ts, <your_factor_name>
 (bid1_qty - ask1_qty) / (bid1_qty + ask1_qty)
 ```
 
-当买一和卖一数量都为零时，结果为 0。
-只使用当前 tick 的买一和卖一数量，不读取未来行情。
-
 ## 2. 路径和 YAML
 
-建议仓库外准备输入目录：
+仓库外准备输入目录：
 
 ```text
 input/
-├── market.parquet
-└── <your_factor_name>.parquet
+├── market.csv（也可以是 Parquet、CSV.GZ 或 Feather）
+└── <your_factor_name>.csv
 ```
 
-也可以直接在命令行传入任意文件路径。
+也可以在命令行中直接指定文件路径。市场、因子和价格限制快照支持 .parquet、.csv、.csv.gz、.feather。
+input-root 会在同名文件中选择唯一存在的扩展名；Excel 不在输入契约内。
 推荐从 `configs/l1_imbalance_single_day_taker.yaml` 或
 `configs/l1_imbalance_single_day_maker.yaml` 复制配置。
 
@@ -93,8 +86,8 @@ paths:
 
 data:
   product: ag
-  market_path: ./input/market.parquet
-  factor_path: ./input/my_ofi.parquet
+  market_path: ./input/market.csv
+  factor_path: ./input/my_ofi.csv
   factor_grid_mode: decision_grid
   eof_is_day_end: true
 
@@ -117,7 +110,7 @@ match:
 
 ## 3. 数据回放和因子对齐
 
-Data 层先校验市场、因子和 manifest 身份，再执行因果
+数据层先校验市场、因子和 manifest 身份，再执行因果
 `decision_grid` backward as-of join。
 
 只有因子源 tick 设置 `factor_decision=true`。
@@ -138,7 +131,7 @@ Data 层先校验市场、因子和 manifest 身份，再执行因果
 策略输出目标仓位、因子值、因子源时间和因子延迟。
 后续撮合和会计模块不重新计算信号。
 
-## 5. Simulation、订单和撮合
+## 5. 模拟交易、订单和撮合
 
 Taker 在订单到达 tick 使用对手 L1 成交。
 Maker 在决策时挂同侧 L1，并使用 MBP expected-queue 估计。
@@ -147,7 +140,6 @@ Maker 规则：
 
 - 等价挂单价先消耗 queue_ahead，队列到零后才成交；
 - 只有成交价严格穿过挂单价才是 trade-through；
-- stale、anomaly、side-ambiguous 行情不成交也不推进队列；
 - 初次不在 L1 或会立即吃单的挂单进入 rejected；
 - 已排队后离开 L1 才 cancel。
 
@@ -158,14 +150,8 @@ Maker 规则：
 开仓成交的逐行 `net_pnl` 为 `-open_fee`。
 平仓成交的逐行 `net_pnl` 为 `gross_pnl-close_fee`。
 
-必须满足：
 
-```text
-sum(net_pnl) = final_cash - initial_cash
-sum(net_pnl) = realized_pnl - total_fee
-```
-
-运行目录包含：
+运行目录固定输出 Parquet，包含：
 
 ```text
 activity_ledger.parquet
@@ -204,8 +190,7 @@ python -m backtrade.cli prepare-input \
 
 已有两份输入时，直接执行 `prepare-input` 即可。
 
-先校验：
-如果使用自定义因子，例如列名 my_ofi：
+使用自定义因子时（例如列名 my_ofi），执行：
 
 ```sh
 python -m backtrade.cli prepare-input \
@@ -261,20 +246,5 @@ python -m backtrade.cli inspect \
 
 启用 `limit_reference.mode: prev_day_vwap_proxy` 或 `official` 时，可运行
 `scripts/build_price_limit_snapshot.py` 生成价格限制快照。脚本支持最简因子
-`tick_ts + 因子列`，会从 market parquet 补齐交易日和合约；完整上下文因子也可直接使用。
+`tick_ts + 因子列`，会从市场表格补齐交易日和合约；完整上下文因子也可直接使用。
 价格限制快照必须覆盖实际回测的每个交易日和合约，`prev_day_vwap_proxy` 只是近似参考价。
-
-## 8. 发布和验收边界
-
-v0.1.0 是首个团队内部可用版本，不代表接口已经稳定到 v1.0。
-单手和无保证金是当前模型边界，也是暂不发布 v1.0 的重要原因。
-
-提交前必须确认：
-
-- 输入市场和因子属于同一商品、合约和交易日期；
-- 因子 manifest 的市场哈希和因子哈希通过；
-- `validate` 通过；
-- `run` 返回 audit passed；
-- `inspect` 显示最终空仓；
-- HTML、manifest 和 parquet 文件都存在；
-- 真实数据和运行产物没有进入 Git 仓库。

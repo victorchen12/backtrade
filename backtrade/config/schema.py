@@ -109,9 +109,9 @@ class DataSourceConfig(BaseModel):
     product: str
     split_id: str | None = None
     max_ticks: int | None = Field(default=None, gt=0)
-    # [README-1] L2 市场 parquet；显式路径优先于 future_l2_data_root 推导值。
+    # [README-1] L2 市场表格；支持 Parquet、CSV/CSV.GZ、Feather，显式路径优先。
     market_path: Path | None = None
-    # [README-1] 因子 parquet；相邻 manifest.json 必须绑定市场文件哈希。
+    # [README-1] 因子表格；相邻 manifest.json 必须绑定市场文件哈希。
     factor_path: Path | None = None
     parts: list[str] = Field(default_factory=lambda: ["test"])
     trading_days: list[str] | None = None

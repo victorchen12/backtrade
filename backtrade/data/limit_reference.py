@@ -9,6 +9,7 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 from backtrade.config.schema import ContractRule
+from backtrade.data.tabular import read_table, table_columns, table_format
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,10 +45,11 @@ def load_price_limit_reference_snapshot(
     snapshot_path = Path(path).expanduser()
     if not snapshot_path.is_file():
         raise FileNotFoundError(f"price-limit reference snapshot not found: {snapshot_path}")
-    frame = pd.read_parquet(snapshot_path, columns=list(SNAPSHOT_COLUMNS))
-    missing = [column for column in SNAPSHOT_COLUMNS if column not in frame.columns]
+    names = set(table_columns(snapshot_path))
+    missing = [column for column in SNAPSHOT_COLUMNS if column not in names]
     if missing:
         raise ValueError(f"price-limit reference snapshot missing columns: {missing}")
+    frame = read_table(snapshot_path, columns=list(SNAPSHOT_COLUMNS))
     frame = frame.copy()
     frame["trading_day"] = frame["trading_day"].astype(str)
     frame["contract"] = frame["contract"].astype(str).str.upper()
@@ -224,15 +226,20 @@ def load_prev_day_vwap_limit_references(
         return {}
 
     aggregates: dict[tuple[str, str], list[float]] = {}
-    parquet = pq.ParquetFile(market_path)
-    schema_names = set(parquet.schema.names)
+    market_path = Path(market_path).expanduser()
+    table_kind = table_format(market_path)
+    schema_names = set(table_columns(market_path))
     columns = ["trading_day", "underlying_secu_cd", "vol_inc", "amt_inc"]
     if "mid1" in schema_names:
         columns.append("mid1")
     elif "last_prc" in schema_names:
         columns.append("last_prc")
-    for batch in parquet.iter_batches(batch_size=batch_size, columns=columns):
-        frame = batch.to_pandas()
+    if table_kind == "parquet":
+        parquet = pq.ParquetFile(market_path)
+        batches = (batch.to_pandas() for batch in parquet.iter_batches(batch_size=batch_size, columns=columns))
+    else:
+        batches = (read_table(market_path, columns=columns),)
+    for frame in batches:
         frame["trading_day"] = frame["trading_day"].astype(str)
         frame["contract"] = frame["underlying_secu_cd"].astype(str).str.upper()
         frame["vol_inc"] = pd.to_numeric(frame["vol_inc"], errors="coerce").fillna(0.0)

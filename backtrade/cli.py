@@ -10,11 +10,11 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-import pyarrow.parquet as pq
 
 from backtrade.config.loader import load_config
 from backtrade.config.loader import validate_result_view_root
 from backtrade.data.future_l2 import MARKET_COLUMNS
+from backtrade.data.tabular import read_table, resolve_table_candidate, table_columns, table_row_count, write_table
 from backtrade.reporting import generate_backtest_report
 from backtrade.run import run_from_config
 from backtrade.runtime.manifest import make_run_id, payload_digest
@@ -35,9 +35,9 @@ def build_parser() -> argparse.ArgumentParser:
         command = commands.add_parser(name)
         command.add_argument("--config", required=True)
         command.add_argument("--profile")
-        command.add_argument("--input-root", help="输入目录；包含 market.parquet 和 YAML 中配置的因子文件")
-        command.add_argument("--market-path", help="自定义市场 parquet；覆盖 input-root/market.parquet")
-        command.add_argument("--factor-path", help="自定义因子 parquet；覆盖 input-root/因子名.parquet")
+        command.add_argument("--input-root", help="输入目录；包含 market 和 YAML 中配置的因子文件（支持 Parquet、CSV/CSV.GZ、Feather）")
+        command.add_argument("--market-path", help="自定义市场表格文件；覆盖 input-root 下的 market 文件")
+        command.add_argument("--factor-path", help="自定义因子表格文件；覆盖 input-root 下的因子文件")
         command.add_argument("--trading-days", nargs="+", help="覆盖 YAML 中的交易日列表")
         command.add_argument("--result-view-root", help="自定义报告根目录；非空目录拒绝覆盖")
     run = commands.choices["run"]
@@ -46,10 +46,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-events", type=int, help="最多回放的事件数；设置后 EOF 为 end_of_data")
     prepare = commands.add_parser("prepare-input")
     prepare.add_argument("--root", help="默认输入目录；为空时由两个显式文件路径推导 manifest 目录")
-    prepare.add_argument("--market-path", help="自定义市场 parquet 路径")
-    prepare.add_argument("--factor-path", help="自定义因子 parquet 路径；manifest 写在同目录")
+    prepare.add_argument("--market-path", help="自定义市场表格文件路径")
+    prepare.add_argument("--factor-path", help="自定义因子表格文件路径；manifest 写在同目录")
     prepare.add_argument("--product", required=True, help="商品代码")
-    prepare.add_argument("--factor-column", default=L1_IMBALANCE_NAME, help="因子 parquet 中的列名；必须与 YAML strategy.factor_column 一致")
+    prepare.add_argument("--factor-column", default=L1_IMBALANCE_NAME, help="因子表格中的列名；必须与 YAML strategy.factor_column 一致")
     derive = commands.add_parser("derive-factor")
     derive.add_argument("--market-path", required=True)
     derive.add_argument("--factor-path", required=True)
@@ -79,7 +79,7 @@ def _load_and_validate(
     data_updates: dict[str, Path] = {}
     if input_root:
         root = Path(input_root).expanduser().resolve()
-        data_updates.update({"market_path": root / "market.parquet", "factor_path": root / f"{cfg.strategy.factor_column}.parquet"})
+        data_updates.update({"market_path": resolve_table_candidate(root, "market"), "factor_path": resolve_table_candidate(root, cfg.strategy.factor_column)})
     # [README-2] 显式文件路径可覆盖 input-root 的约定文件名，适合已有数据目录。
     if market_path:
         data_updates["market_path"] = Path(market_path).expanduser().resolve()
@@ -111,32 +111,32 @@ def _prepare_input(
     *,
     factor_column: str = L1_IMBALANCE_NAME,
 ) -> dict[str, Any]:
-    # [README-1] 输入登记只检查身份和表结构，不改写原始 parquet。
+    # [README-1] 输入登记只检查身份和表结构，不改写原始表格文件。
     factor_column = validate_factor_name(factor_column)
     root = Path(root_arg).expanduser().resolve() if root_arg else None
-    market_path = Path(market_path_arg).expanduser().resolve() if market_path_arg else root / "market.parquet" if root else None
-    factor_path = Path(factor_path_arg).expanduser().resolve() if factor_path_arg else root / f"{factor_column}.parquet" if root else None
+    market_path = Path(market_path_arg).expanduser().resolve() if market_path_arg else resolve_table_candidate(root, "market") if root else None
+    factor_path = Path(factor_path_arg).expanduser().resolve() if factor_path_arg else resolve_table_candidate(root, factor_column) if root else None
     if market_path is None or factor_path is None:
         raise ValueError("prepare-input requires --root or both explicit file paths")
     if not market_path.is_file() or not factor_path.is_file():
         raise FileNotFoundError(f"input file missing: market={market_path}, factor={factor_path}")
-    market_names = set(pq.ParquetFile(market_path).schema.names)
+    market_names = set(table_columns(market_path))
     missing_market = sorted(set(MARKET_COLUMNS) - market_names)
     if missing_market:
-        raise ValueError(f"market parquet is missing required columns: {missing_market}")
-    factor_names = set(pq.ParquetFile(factor_path).schema.names)
+        raise ValueError(f"market input is missing required columns: {missing_market}")
+    factor_names = set(table_columns(factor_path))
     required_factor = {"tick_ts", factor_column}
     if required_factor - factor_names:
-        raise ValueError(f"factor parquet requires tick_ts and {factor_column}")
+        raise ValueError(f"factor input requires tick_ts and {factor_column}")
     factor_read_columns = ["tick_ts", factor_column]
     factor_context = ["product", "trading_day", "session_id", "underlying_secu_cd"]
     if set(factor_context).issubset(factor_names):
         factor_read_columns = [*factor_context, *factor_read_columns]
-    factors = pd.read_parquet(factor_path, columns=factor_read_columns)
+    factors = read_table(factor_path, columns=factor_read_columns)
     factors["tick_ts"] = pd.to_datetime(factors["tick_ts"])
     key_columns = [*factor_context, "tick_ts"] if set(factor_context).issubset(factors.columns) else ["tick_ts"]
     if factors["tick_ts"].isna().any() or factors.duplicated(key_columns).any():
-        raise ValueError("factor parquet must have unique, non-null factor keys")
+        raise ValueError("factor input must have unique, non-null factor keys")
     if not factors[factor_column].map(lambda value: pd.notna(value) and np.isfinite(float(value))).all():
         raise ValueError(f"{factor_column} must contain finite values")
     manifest = {
@@ -149,7 +149,7 @@ def _prepare_input(
         "factor_columns": [factor_column],
         "input_columns": {"market_required": MARKET_COLUMNS, "factor_required": ["tick_ts", factor_column]},
     }
-    # [README-1] manifest 与因子 parquet 同目录，并绑定两份输入哈希。
+    # [README-1] manifest 与因子输入同目录，并绑定两份输入哈希。
     manifest_path = factor_path.with_name("manifest.json")
     if manifest_path.exists():
         raise FileExistsError(f"input manifest already exists: {manifest_path}")
@@ -160,7 +160,7 @@ def _prepare_input(
         "market": str(market_path),
         "factor": str(factor_path),
         "factor_column": factor_column,
-        "market_rows": int(pq.ParquetFile(market_path).metadata.num_rows),
+        "market_rows": table_row_count(market_path),
         "factor_rows": int(len(factors)),
     }
 
@@ -177,15 +177,15 @@ def _derive_factor(
     market_path = Path(market_path_arg).expanduser().resolve()
     factor_path = Path(factor_path_arg).expanduser().resolve()
     if not market_path.is_file():
-        raise FileNotFoundError(f"market parquet is missing: {market_path}")
+        raise FileNotFoundError(f"market input is missing: {market_path}")
     if factor_path.exists():
-        raise FileExistsError(f"factor parquet already exists: {factor_path}")
-    names = set(pq.ParquetFile(market_path).schema.names)
+        raise FileExistsError(f"factor input already exists: {factor_path}")
+    names = set(table_columns(market_path))
     missing = sorted(set(MARKET_COLUMNS) - names)
     if missing:
-        raise ValueError(f"market parquet is missing required columns: {missing}")
+        raise ValueError(f"market input is missing required columns: {missing}")
     columns = [*MARKET_COLUMNS, "product"]
-    frame = pd.read_parquet(market_path, columns=[column for column in columns if column in names])
+    frame = read_table(market_path, columns=[column for column in columns if column in names])
     if "product" not in frame:
         frame["product"] = str(product).lower()
     frame["product"] = frame["product"].fillna(product).astype(str).str.lower()
@@ -197,7 +197,7 @@ def _derive_factor(
     ]
     factor = frame[["product", "trading_day", "session_id", "tick_ts", "underlying_secu_cd"]].copy()
     factor[factor_column] = values
-    factor.to_parquet(factor_path, index=False)
+    write_table(factor, factor_path)
     return {"market": str(market_path), "factor": str(factor_path), "factor_column": factor_column, "rows": int(len(factor))}
 
 

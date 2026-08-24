@@ -721,6 +721,7 @@ class CompactV9Runner:
             Path(__file__).parents[1] / "strategies" / "signed_factor.py",
             Path(__file__).parents[1] / "strategies" / "factors.py",
             Path(__file__).parents[1] / "data" / "future_l2.py",
+            Path(__file__).parents[1] / "data" / "tabular.py",
             Path(__file__).parents[1] / "data" / "market_quality.py",
             Path(__file__).parents[1] / "data" / "replay.py",
         ]

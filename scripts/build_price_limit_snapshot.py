@@ -11,9 +11,9 @@ import shutil
 from pathlib import Path
 
 import pandas as pd
-import pyarrow.parquet as pq
 
 from backtrade.config.loader import load_config
+from backtrade.data.tabular import read_table, table_columns
 from backtrade.data.limit_reference import (
     _rule_version,
     load_prev_day_vwap_limit_references,
@@ -31,28 +31,28 @@ _FACTOR_CONTEXT_COLUMNS = frozenset({"product", "trading_day", "session_id", "un
 
 
 def _load_factor_keys(factor_path: Path, market_path: Path) -> pd.DataFrame:
-    """Return trading-day/contract keys for full-context or minimal factor parquet."""
-    factor_names = set(pq.ParquetFile(factor_path).schema.names)
+    """Return trading-day/contract keys for full-context or minimal factor input."""
+    factor_names = set(table_columns(factor_path))
     if "tick_ts" not in factor_names:
-        raise ValueError("factor parquet requires tick_ts")
+        raise ValueError("factor input requires tick_ts")
     present_context = _FACTOR_CONTEXT_COLUMNS & factor_names
     if present_context and present_context != _FACTOR_CONTEXT_COLUMNS:
         raise ValueError("factor context columns must be complete JOIN_KEYS or omitted")
     if present_context == _FACTOR_CONTEXT_COLUMNS:
-        keys = pd.read_parquet(
+        keys = read_table(
             factor_path,
             columns=["trading_day", "underlying_secu_cd"],
         )
     else:
-        factor_ticks = pd.read_parquet(factor_path, columns=["tick_ts"])
-        market_context = pd.read_parquet(
+        factor_ticks = read_table(factor_path, columns=["tick_ts"])
+        market_context = read_table(
             market_path,
             columns=["tick_ts", "trading_day", "underlying_secu_cd"],
         )
         factor_ticks["tick_ts"] = pd.to_datetime(factor_ticks["tick_ts"], errors="raise")
         market_context["tick_ts"] = pd.to_datetime(market_context["tick_ts"], errors="raise")
         if factor_ticks["tick_ts"].duplicated().any():
-            raise ValueError("factor parquet contains duplicate tick_ts")
+            raise ValueError("factor input contains duplicate tick_ts")
         if market_context["tick_ts"].duplicated().any():
             raise ValueError("minimal factor tick_ts does not uniquely identify a market tick")
         keys = factor_ticks.merge(
@@ -64,7 +64,7 @@ def _load_factor_keys(factor_path: Path, market_path: Path) -> pd.DataFrame:
         if keys[["trading_day", "underlying_secu_cd"]].isna().any().any():
             raise ValueError("minimal factor tick_ts does not match a market tick")
     if keys.empty:
-        raise ValueError("factor parquet has no rows")
+        raise ValueError("factor input has no rows")
     if keys[["trading_day", "underlying_secu_cd"]].isna().any().any():
         raise ValueError("factor key columns cannot contain null values")
     return (
