@@ -11,3 +11,4 @@ inputs/
 *.html
 **/manifest.json
 *.log
+tests/
