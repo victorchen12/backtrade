@@ -110,6 +110,7 @@ class DataSourceConfig(BaseModel):
     # [README-1] 商品代码决定默认市场/因子目录，也用于校验两份输入身份。
     product: str
     split_id: str | None = None
+    split_ids: list[str] | None = None
     max_ticks: int | None = Field(default=None, gt=0)
     # [README-1] L2 市场表格；支持 Parquet、CSV/CSV.GZ、Feather，显式路径优先。
     market_path: Path | None = None
@@ -133,6 +134,26 @@ class DataSourceConfig(BaseModel):
     def validate_eof_contract(self) -> "DataSourceConfig":
         if self.max_ticks is None and not self.eof_is_day_end:
             raise ValueError("unbounded real-data runs must explicitly set data.eof_is_day_end=true")
+        return self
+
+    @model_validator(mode="after")
+    def validate_split_selection(self) -> "DataSourceConfig":
+        if self.split_id is not None and self.split_ids is not None:
+            raise ValueError("data.split_id and data.split_ids cannot both be configured")
+        if self.split_ids is not None:
+            normalized = [
+                str(value).strip().zfill(3)
+                if str(value).strip().isdigit()
+                else str(value).strip()
+                for value in self.split_ids
+            ]
+            if not normalized or any(not value for value in normalized):
+                raise ValueError("data.split_ids must not be empty")
+            if len(normalized) != len(set(normalized)):
+                raise ValueError("data.split_ids must not contain duplicates")
+            if normalized != sorted(normalized):
+                raise ValueError("data.split_ids must be in ascending order")
+            self.split_ids = normalized
         return self
 
 

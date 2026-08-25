@@ -100,6 +100,37 @@ def test_campaign_builds_six_factor_by_two_mode_jobs_without_yaml_duplication(tm
         assert job.output_root == tmp_path / "raw" / job.factor / job.mode
         assert job.report_root == tmp_path / "reports" / job.factor / job.mode
 
+def test_campaign_full_jobs_keep_all_splits_in_one_continuous_selection(tmp_path: Path) -> None:
+    campaign = _campaign_module()
+    split_ids = [f"{index:03d}" for index in range(32)]
+    jobs = campaign.build_jobs(
+        _base_config(),
+        split_id=None,
+        split_ids=split_ids,
+        output_base=tmp_path / "raw",
+        result_base=tmp_path / "reports",
+        market_path=tmp_path / "market.parquet",
+        factor_path=tmp_path / "factors.parquet",
+        factor_manifest_path=tmp_path / "factor_bundle_manifest.json",
+    )
+    assert len(jobs) == 12
+    assert all(job.config.data.split_id is None for job in jobs)
+    assert all(job.config.data.split_ids == split_ids for job in jobs)
+
+
+def test_campaign_build_jobs_validates_split_selection_order(tmp_path: Path) -> None:
+    campaign = _campaign_module()
+    kwargs = {
+        "output_base": tmp_path / "raw",
+        "result_base": tmp_path / "reports",
+        "market_path": tmp_path / "market.parquet",
+        "factor_path": tmp_path / "factors.parquet",
+        "factor_manifest_path": tmp_path / "factor_bundle_manifest.json",
+    }
+    with pytest.raises(ValueError, match="ascending"):
+        campaign.build_jobs(_base_config(), split_id=None, split_ids=["002", "001"], **kwargs)
+    with pytest.raises(ValueError, match="duplicate"):
+        campaign.build_jobs(_base_config(), split_id=None, split_ids=["1", "001"], **kwargs)
 
 def test_campaign_preflights_every_target_before_running(tmp_path: Path) -> None:
     campaign = _campaign_module()

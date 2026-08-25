@@ -258,11 +258,12 @@ def _validate_factor_manifest(cfg: BacktradeConfig, factor_path: Path) -> dict:
     return manifest
 
 
-def load_factor_frame_for_split(cfg: BacktradeConfig, nrows: int | None = None) -> pd.DataFrame:
+def load_factor_frame_for_split(cfg: BacktradeConfig, nrows: int | None = None, *, validate_manifest: bool = True) -> pd.DataFrame:
     path = selected_factor_screen_path(cfg)
     if not path.is_file():
         raise FileNotFoundError(f"canonical factor input is missing: {path}")
-    _validate_factor_manifest(cfg, path)
+    if validate_manifest:
+        _validate_factor_manifest(cfg, path)
     names = set(table_columns(path))
     factor_name = cfg.strategy.factor_column
     required = {"tick_ts", factor_name}
@@ -532,7 +533,7 @@ def load_future_l2_frame(cfg: BacktradeConfig, max_events: int | None = None) ->
     return aligned
 
 
-def iter_future_l2_ticks(cfg: BacktradeConfig, max_events: int | None = None, batch_size: int = 100_000) -> Iterator[MarketTick]:
+def _iter_future_l2_ticks_single(cfg: BacktradeConfig, max_events: int | None = None, batch_size: int = 100_000, *, manifest_validated: bool = False) -> Iterator[MarketTick]:
     if max_events is not None and int(max_events) <= 0:
         raise ValueError("max_events must be positive")
     if batch_size <= 0:
@@ -540,7 +541,7 @@ def iter_future_l2_ticks(cfg: BacktradeConfig, max_events: int | None = None, ba
     market_path = processed_market_path(cfg)
     if not market_path.is_file():
         raise FileNotFoundError(f"market input is missing: {market_path}")
-    factors = load_factor_frame_for_split(cfg)
+    factors = load_factor_frame_for_split(cfg, validate_manifest=not manifest_validated)
     days = set(factors["trading_day"].astype(str)) if "trading_day" in factors else set(cfg.data.trading_days or [])
     if "trading_day" not in factors:
         market = _read_market(market_path, days, product=cfg.data.product, tick_size=float(cfg.contract_rule().tick_size))
@@ -592,6 +593,38 @@ def iter_future_l2_ticks(cfg: BacktradeConfig, max_events: int | None = None, ba
         raise ValueError(f"market input has no rows for selected trading days: {sorted(days)[:5]}")
 
 
+def iter_future_l2_ticks(cfg: BacktradeConfig, max_events: int | None = None, batch_size: int = 100_000) -> Iterator[MarketTick]:
+    split_ids = cfg.data.split_ids
+    if not split_ids:
+        yield from _iter_future_l2_ticks_single(cfg, max_events=max_events, batch_size=batch_size)
+        return
+    if cfg.data.split_id is not None:
+        raise ValueError("data.split_id and data.split_ids cannot both be configured")
+    if max_events is not None and int(max_events) <= 0:
+        raise ValueError("max_events must be positive")
+    factor_path = selected_factor_screen_path(cfg)
+    if "split_id" not in set(table_columns(factor_path)):
+        raise ValueError("multi-split selection requires factor input column split_id")
+    _validate_factor_manifest(cfg, selected_factor_screen_path(cfg))
+    total_limit = int(max_events) if max_events is not None else cfg.data.max_ticks
+    produced = 0
+    for split_id in split_ids:
+        remaining = None if total_limit is None else int(total_limit) - produced
+        if remaining is not None and remaining <= 0:
+            return
+        data = cfg.data.model_copy(update={"split_id": str(split_id), "split_ids": None, "max_ticks": None})
+        split_cfg = cfg.model_copy(update={"data": data})
+        for tick in _iter_future_l2_ticks_single(
+            split_cfg,
+            max_events=remaining,
+            batch_size=batch_size,
+            manifest_validated=True,
+        ):
+            yield tick
+            produced += 1
+
+            if total_limit is not None and produced >= int(total_limit):
+                return
 def load_future_l2_ticks(cfg: BacktradeConfig, max_events: int | None = None) -> list[MarketTick]:
     return list(iter_future_l2_ticks(cfg, max_events=max_events))
 

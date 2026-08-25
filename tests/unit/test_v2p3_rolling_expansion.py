@@ -8,8 +8,13 @@ import pandas as pd
 import pytest
 
 from backtrade.cli import _prepare_input, build_parser
-from backtrade.config.schema import BacktradeConfig
-from backtrade.data.future_l2 import _iter_market_frames, _validate_factor_manifest, load_factor_frame_for_split
+from backtrade.config.schema import BacktradeConfig, DataSourceConfig
+from backtrade.data.future_l2 import (
+    _iter_market_frames,
+    _validate_factor_manifest,
+    iter_future_l2_ticks,
+    load_factor_frame_for_split,
+)
 
 
 FACTOR_A = "v2p3_factor_a"
@@ -116,6 +121,20 @@ def _bundle_config(
     return BacktradeConfig.model_validate(
         {
             "initial_cash": 1_000_000,
+            "contracts": {
+                "ag": {
+                    "code": "AG",
+                    "exchange": "SHFE",
+                    "multiplier": 15.0,
+                    "tick_size": 1.0,
+                    "fee": {
+                        "open": {"mode": "rate", "value": 0.00005},
+                        "close": {"mode": "rate", "value": 0.00005},
+                        "close_today": {"mode": "rate", "value": 0.00005},
+                    },
+                    "price_limit": {"mode": "percent", "value": 0.2},
+                }
+            },
             "data": {
                 "product": product,
                 "market_path": str(market_path),
@@ -126,10 +145,24 @@ def _bundle_config(
                 "max_ticks": 1,
                 "eof_is_day_end": False,
             },
+
             "strategy": {"factor_name": FACTOR_A, "factor_column": FACTOR_A},
         }
     )
 
+def test_data_source_rejects_ambiguous_or_empty_split_selection() -> None:
+    with pytest.raises(ValueError, match="split_id"):
+        DataSourceConfig(
+            product="ag", split_id="001", split_ids=["002"], max_ticks=1
+        )
+    with pytest.raises(ValueError, match="split_ids"):
+        DataSourceConfig(product="ag", split_ids=[], max_ticks=1)
+    with pytest.raises(ValueError, match="ascending"):
+        DataSourceConfig(product="ag", split_ids=["002", "001"], max_ticks=1)
+    with pytest.raises(ValueError, match="duplicate"):
+        DataSourceConfig(product="ag", split_ids=["1", "001"], max_ticks=1)
+    normalized = DataSourceConfig(product="ag", split_ids=["1", "002"], max_ticks=1)
+    assert normalized.split_ids == ["001", "002"]
 
 def test_prepare_input_writes_factor_bundle_manifest_without_rewriting_source_data(tmp_path: Path) -> None:
     market_path, factor_path, source_manifest, bundle_manifest = _prepare_bundle(tmp_path)
@@ -256,8 +289,129 @@ def test_market_reader_yields_bounded_batches_with_source_order(tmp_path: Path) 
     stream = _iter_market_frames(market_path, {"2025-04-15"}, product="ag", tick_size=1.0, batch_size=1)
     first = next(stream)
     second = next(stream)
-
     assert len(first) == 1
     assert len(second) == 1
     assert first["source_seq"].tolist() == [0]
     assert second["source_seq"].tolist() == [1]
+
+
+def test_full_split_stream_selects_one_split_at_a_time_without_resetting_order(
+    tmp_path: Path, monkeypatch
+) -> None:
+    market_path = tmp_path / "market.parquet"
+    factor_path = tmp_path / "factors.parquet"
+    bundle_path = tmp_path / "bundle.json"
+    source_path = tmp_path / "source.json"
+    market_rows = []
+    factor_rows = []
+    for index, day in enumerate(("2025-04-15", "2025-04-16"), start=1):
+        row = {
+            "product": "ag",
+            "trading_day": day,
+            "session_id": "day",
+            "tick_ts": pd.Timestamp(f"{day} 09:00:00"),
+            "underlying_secu_cd": "AG2506",
+            "last_prc": 100.0 + index,
+            "vol_inc": 1,
+            "amt_inc": (100.0 + index) * 15.0,
+        }
+        for level in range(1, 6):
+            row[f"bid{level}_prc"] = row["last_prc"] - level
+            row[f"ask{level}_prc"] = row["last_prc"] + level
+            row[f"bid{level}_qty"] = 10
+            row[f"ask{level}_qty"] = 10
+        market_rows.append(row)
+        factor_rows.append(
+            {
+                "split_id": f"{index:03d}",
+                "part": "test",
+                "product": "ag",
+                "trading_day": day,
+                "session_id": "day",
+                "tick_ts": row["tick_ts"],
+                "underlying_secu_cd": "AG2506",
+                FACTOR_A: 0.9 if index == 1 else -0.9,
+                FACTOR_B: 0.1,
+            }
+        )
+    pd.DataFrame(market_rows).to_parquet(market_path, index=False)
+    pd.DataFrame(factor_rows).to_parquet(factor_path, index=False)
+    _write_source_manifest(source_path, factor_path)
+    _prepare_input(
+        None,
+        "ag",
+        str(market_path),
+        str(factor_path),
+        factor_columns=[FACTOR_A, FACTOR_B],
+        manifest_path_arg=str(bundle_path),
+        source_manifest_path_arg=str(source_path),
+    )
+    template = _bundle_config(market_path, factor_path, bundle_path)
+    cfg = template.model_copy(
+        update={
+            "data": template.data.model_copy(
+                update={"split_id": None, "split_ids": ["001", "002"], "max_ticks": None, "eof_is_day_end": True}
+            )
+        }
+    )
+    seen_splits: list[str | None] = []
+    from backtrade.data import future_l2
+
+    original_loader = future_l2.load_factor_frame_for_split
+
+    def recording_loader(config, *args, **kwargs):
+        seen_splits.append(config.data.split_id)
+        return original_loader(config, *args, **kwargs)
+
+
+    monkeypatch.setattr(future_l2, "load_factor_frame_for_split", recording_loader)
+    ticks = list(iter_future_l2_ticks(cfg, batch_size=1))
+
+    assert seen_splits == ["001", "002"]
+    assert [tick.trading_day for tick in ticks] == ["2025-04-15", "2025-04-16"]
+    assert [tick.factors["active_factor"] for tick in ticks] == [0.9, -0.9]
+
+
+def test_multi_split_stream_rejects_factor_input_without_split_id(tmp_path: Path) -> None:
+    market_path, factor_path, source_manifest, bundle_manifest = _prepare_bundle(tmp_path)
+    factors = pd.read_parquet(factor_path).drop(columns=["split_id"])
+    factors.to_parquet(factor_path, index=False)
+    source_manifest.unlink()
+    _write_source_manifest(source_manifest, factor_path)
+    bundle_manifest.unlink()
+    _prepare_input(
+        None,
+        "ag",
+        str(market_path),
+        str(factor_path),
+        factor_columns=[FACTOR_A, FACTOR_B],
+        manifest_path_arg=str(bundle_manifest),
+        source_manifest_path_arg=str(source_manifest),
+    )
+    template = _bundle_config(market_path, factor_path, bundle_manifest)
+    cfg = template.model_copy(
+        update={
+            "data": template.data.model_copy(
+                update={"split_id": None, "split_ids": ["015"], "max_ticks": None, "eof_is_day_end": True}
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="split_id"):
+        next(iter_future_l2_ticks(cfg, batch_size=1))
+
+
+def test_single_split_minimal_factor_input_keeps_legacy_selection(tmp_path: Path) -> None:
+    market_path, factor_path, source_manifest, bundle_manifest = _prepare_bundle(tmp_path)
+    pd.read_parquet(factor_path).drop(columns=["split_id"]).to_parquet(factor_path, index=False)
+    source_manifest.unlink()
+    _write_source_manifest(source_manifest, factor_path)
+    bundle_manifest.unlink()
+    _prepare_input(
+        None, "ag", str(market_path), str(factor_path),
+        factor_columns=[FACTOR_A, FACTOR_B],
+        manifest_path_arg=str(bundle_manifest),
+        source_manifest_path_arg=str(source_manifest),
+    )
+    cfg = _bundle_config(market_path, factor_path, bundle_manifest)
+    tick = next(iter_future_l2_ticks(cfg, batch_size=1))
+    assert tick.trading_day == "2025-04-15"

@@ -19,7 +19,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from backtrade.config.loader import load_config
-from backtrade.config.schema import BacktradeConfig, StrategyConfig
+from backtrade.config.schema import BacktradeConfig, DataSourceConfig, StrategyConfig
 from backtrade.reporting import generate_backtest_report
 from backtrade.run import run_from_config
 from backtrade.runtime.validation import validate_config
@@ -106,8 +106,17 @@ def build_jobs(
     market_path: Path,
     factor_path: Path,
     factor_manifest_path: Path,
+    split_ids: list[str] | None = None,
 ) -> list[CampaignJob]:
     _validate_base_config(base_config)
+    if split_id is not None and split_ids is not None:
+        raise ValueError("split_id and split_ids cannot both be configured")
+    if split_ids is not None:
+        split_ids = DataSourceConfig(
+            product=base_config.data.product,
+            split_ids=split_ids,
+            max_ticks=1,
+        ).split_ids
     output_base = Path(output_base).expanduser().resolve()
     result_base = Path(result_base).expanduser().resolve()
     market_path = Path(market_path).expanduser().resolve()
@@ -122,6 +131,7 @@ def build_jobs(
                 update={
                     "product": "ag",
                     "split_id": split_id,
+                    "split_ids": split_ids,
                     "max_ticks": None,
                     "market_path": market_path,
                     "factor_path": factor_path,
@@ -209,6 +219,7 @@ def validate_campaign_input_coverage(jobs: list[CampaignJob]) -> set[str]:
         Path(first.market_path).resolve(),
         Path(first.factor_path).resolve(),
         first.split_id,
+        tuple(first.split_ids or ()),
         tuple(first.parts),
     )
     for job in jobs[1:]:
@@ -217,6 +228,7 @@ def validate_campaign_input_coverage(jobs: list[CampaignJob]) -> set[str]:
             Path(data.market_path).resolve(),
             Path(data.factor_path).resolve(),
             data.split_id,
+            tuple(data.split_ids or ()),
             tuple(data.parts),
         )
         if candidate != selection:
@@ -226,13 +238,22 @@ def validate_campaign_input_coverage(jobs: list[CampaignJob]) -> set[str]:
     market_path = selection[0]
     factor_schema = pq.ParquetFile(factor_path).schema_arrow
     required_columns = {"part", "trading_day"}
-    if first.split_id is not None:
+    if first.split_id is not None or first.split_ids:
         required_columns.add("split_id")
     missing_columns = sorted(required_columns - set(factor_schema.names))
     if missing_columns:
         raise ValueError(f"campaign factor input is missing columns: {missing_columns}")
     factor_filters: list[tuple[str, str, object]] = [("part", "in", list(first.parts))]
-    if first.split_id is not None:
+    if first.split_ids:
+        split_type = factor_schema.field("split_id").type
+        if pa.types.is_integer(split_type):
+            split_values: object = [int(value) for value in first.split_ids]
+        elif pa.types.is_string(split_type) or pa.types.is_large_string(split_type):
+            split_values = [str(value).zfill(3) for value in first.split_ids]
+        else:
+            raise ValueError(f"campaign factor split_id type is unsupported: {split_type}")
+        factor_filters.append(("split_id", "in", split_values))
+    elif first.split_id is not None:
         split_type = factor_schema.field("split_id").type
         if pa.types.is_integer(split_type):
             split_value: object = int(first.split_id)
@@ -561,11 +582,13 @@ def main(argv: list[str] | None = None) -> int:
     base_config = load_config(BASE_CONFIG_PATH)
     if args.scope == "sample":
         split_id = "015"
+        split_ids = None
         output_base = SAMPLE_OUTPUT_BASE
         result_base = SAMPLE_RESULT_BASE
     else:
         validate_full_split_coverage(FACTOR_PATH)
         split_id = None
+        split_ids = sorted(EXPECTED_TEST_SPLITS)
         output_base = FULL_OUTPUT_BASE
         result_base = FULL_RESULT_BASE
     jobs = build_jobs(
@@ -576,6 +599,7 @@ def main(argv: list[str] | None = None) -> int:
         market_path=MARKET_PATH,
         factor_path=FACTOR_PATH,
         factor_manifest_path=FACTOR_MANIFEST_PATH,
+        split_ids=split_ids,
     )
     results = execute_campaign(
         jobs,
