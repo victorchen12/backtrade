@@ -5,7 +5,9 @@ import json
 import multiprocessing
 import queue
 import sys
+import time
 import traceback
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,15 +15,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if __package__ in {None, ""} and str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-import pyarrow as pa  # noqa: E402
-import pyarrow.parquet as pq  # noqa: E402
+import pyarrow as pa
+import pyarrow.parquet as pq
 
-from backtrade.config.loader import load_config  # noqa: E402
-from backtrade.config.schema import BacktradeConfig, StrategyConfig  # noqa: E402
-from backtrade.reporting import generate_backtest_report  # noqa: E402
-from backtrade.run import run_from_config  # noqa: E402
-from backtrade.runtime.validation import validate_config  # noqa: E402
-
+from backtrade.config.loader import load_config
+from backtrade.config.schema import BacktradeConfig, StrategyConfig
+from backtrade.reporting import generate_backtest_report
+from backtrade.run import run_from_config
+from backtrade.runtime.validation import validate_config
 
 BASE_CONFIG_PATH = PROJECT_ROOT / "configs" / "l1_imbalance_single_day_taker.yaml"
 MARKET_PATH = Path("/data1/cws/future_l2/v2p3_dataset_24_26/raw_input/ag_con_tick.parquet")
@@ -61,7 +62,23 @@ class CampaignJob:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the fixed v2p3 rolling six-factor campaign")
     parser.add_argument("--scope", choices=["sample", "full"], required=True)
+    parser.add_argument(
+        "--factor-workers",
+        type=_factor_worker_count,
+        default=1,
+        help="number of factors to run concurrently (1-6; each factor runs maker then taker)",
+    )
     return parser
+
+
+def _factor_worker_count(value: str) -> int:
+    try:
+        workers = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("factor workers must be an integer from 1 to 6") from exc
+    if not 1 <= workers <= len(FACTOR_COLUMNS):
+        raise argparse.ArgumentTypeError("factor workers must be from 1 to 6")
+    return workers
 
 
 def _validate_base_config(config: BacktradeConfig) -> None:
@@ -139,6 +156,24 @@ def build_jobs(
             )
             jobs.append(CampaignJob(factor, mode, config, output_root, report_root))
     return jobs
+
+
+def group_jobs_by_factor(jobs: list[CampaignJob]) -> list[list[CampaignJob]]:
+    groups: dict[str, list[CampaignJob]] = {}
+    seen: set[tuple[str, str]] = set()
+    for job in jobs:
+        key = (job.factor, job.mode)
+        if key in seen:
+            raise ValueError(f"duplicate campaign job: {job.factor}/{job.mode}")
+        seen.add(key)
+        groups.setdefault(job.factor, []).append(job)
+    for factor, group in groups.items():
+        modes = tuple(job.mode for job in group)
+        if modes != MATCH_MODES:
+            raise ValueError(
+                f"campaign factor {factor} must run maker then taker; got {modes}"
+            )
+    return list(groups.values())
 
 
 def _nonempty(path: Path) -> bool:
@@ -256,65 +291,244 @@ def validate_full_split_coverage(factor_path: Path) -> set[str]:
     return actual
 
 
-def _run_job_child(job: CampaignJob, validation: dict, result_queue) -> None:
-    try:
-        summary = run_from_config(
-            job.config,
-            output_root=job.output_root,
-            input_manifest={"validation": validation},
-        )
-        if not summary.get("audit", {}).get("passed"):
-            raise RuntimeError(
-                f"audit failed for {job.factor}/{job.mode}: "
-                f"{summary.get('audit', {}).get('errors', [])}"
-            )
-        report = generate_backtest_report(
-            job.output_root,
-            job.config.paths.result_view_root,
-            factor_name=job.factor,
-            mode=job.mode,
-        )
-        result_queue.put(
-            (
-                "ok",
-                {
-                    "factor": job.factor,
-                    "mode": job.mode,
-                    "output_root": str(job.output_root),
-                    "report_root": str(job.report_root),
-                    "summary": summary,
-                    "report": report,
-                },
-            )
-        )
-    except BaseException as exc:
-        result_queue.put(("error", f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"))
-
-
-def _execute_job_isolated(job: CampaignJob, validation: dict) -> dict:
-    methods = multiprocessing.get_all_start_methods()
-    context = multiprocessing.get_context("fork" if "fork" in methods else methods[0])
-    result_queue = context.Queue()
-    process = context.Process(target=_run_job_child, args=(job, validation, result_queue))
-    process.start()
-    process.join()
-    try:
-        status, payload = result_queue.get(timeout=5)
-    except queue.Empty as exc:
+def _execute_job(job: CampaignJob, validation: dict) -> dict:
+    summary = run_from_config(
+        job.config,
+        output_root=job.output_root,
+        input_manifest={"validation": validation},
+    )
+    if not summary.get("audit", {}).get("passed"):
         raise RuntimeError(
-            f"isolated campaign job exited without a result: {job.factor}/{job.mode} "
-            f"(exitcode={process.exitcode})"
-        ) from exc
+            f"audit failed for {job.factor}/{job.mode}: "
+            f"{summary.get('audit', {}).get('errors', [])}"
+        )
+    report = generate_backtest_report(
+        job.output_root,
+        job.config.paths.result_view_root,
+        factor_name=job.factor,
+        mode=job.mode,
+    )
+    return {
+        "factor": job.factor,
+        "mode": job.mode,
+        "output_root": str(job.output_root),
+        "report_root": str(job.report_root),
+        "summary": summary,
+        "report": report,
+    }
+
+
+def _run_factor_group_child(
+    group_index: int,
+    total_groups: int,
+    total_jobs: int,
+    items: list[tuple[int, CampaignJob, dict]],
+    execute_job: Callable[[CampaignJob, dict], dict],
+    result_queue,
+) -> None:
+    try:
+        print(
+            json.dumps(
+                {
+                    "event": "factor_start",
+                    "index": group_index + 1,
+                    "total": total_groups,
+                    "factor": items[0][1].factor,
+                }
+            ),
+            flush=True,
+        )
+        results: list[tuple[int, dict]] = []
+        for job_index, job, validation in items:
+            print(
+                json.dumps(
+                    {
+                        "event": "start",
+                        "index": job_index + 1,
+                        "total": total_jobs,
+                        "factor": job.factor,
+                        "mode": job.mode,
+                    }
+                ),
+                flush=True,
+            )
+            results.append((job_index, execute_job(job, validation)))
+            print(
+                json.dumps(
+                    {
+                        "event": "complete",
+                        "index": job_index + 1,
+                        "total": total_jobs,
+                        "factor": job.factor,
+                        "mode": job.mode,
+                    }
+                ),
+                flush=True,
+            )
+        result_queue.put(("ok", group_index, results))
+    except Exception as exc:  # noqa: BLE001 - propagate every job failure to the parent
+        result_queue.put(
+            ("error", group_index, f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}")
+        )
+
+
+def _factor_worker_context():
+    return multiprocessing.get_context("spawn")
+
+
+def _execute_factor_groups(
+    jobs: list[CampaignJob],
+    validations: list[dict],
+    *,
+    factor_workers: int,
+    execute_job: Callable[[CampaignJob, dict], dict] = _execute_job,
+) -> list[dict]:
+    groups = group_jobs_by_factor(jobs)
+    validation_by_job = {
+        (job.factor, job.mode): validation
+        for job, validation in zip(jobs, validations, strict=True)
+    }
+    position_by_job = {
+        (job.factor, job.mode): index
+        for index, job in enumerate(jobs)
+    }
+    group_items = [
+        [
+            (
+                position_by_job[(job.factor, job.mode)],
+                job,
+                validation_by_job[(job.factor, job.mode)],
+            )
+            for job in group
+        ]
+        for group in groups
+    ]
+    context = _factor_worker_context()
+    result_queue = context.Queue()
+    active: dict[int, multiprocessing.Process] = {}
+    completed: dict[int, list[tuple[int, dict]]] = {}
+    deferred_messages: list[tuple[str, int, object]] = []
+    blocked_dead: set[int] = set()
+    next_group = 0
+
+    def start_group(group_index: int) -> None:
+        items = group_items[group_index]
+        process = context.Process(
+            target=_run_factor_group_child,
+            args=(
+                group_index,
+                len(groups),
+                len(jobs),
+                items,
+                execute_job,
+                result_queue,
+            ),
+        )
+        process.start()
+        active[group_index] = process
+
+    try:
+        while next_group < len(groups) and len(active) < factor_workers:
+            start_group(next_group)
+            next_group += 1
+
+        while active:
+            if deferred_messages:
+                status, group_index, payload = deferred_messages.pop(0)
+            else:
+                try:
+                    status, group_index, payload = result_queue.get(timeout=0.5)
+                except queue.Empty as exc:
+                    dead = [
+                        index for index, process in active.items() if not process.is_alive()
+                    ]
+                    if not dead:
+                        continue
+                    blocked_dead.update(dead)
+                    failed_index = dead[0]
+                    deadline = time.monotonic() + 1
+                    while True:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            process = active[failed_index]
+                            raise RuntimeError(
+                                "factor worker exited without a result: "
+                                f"{groups[failed_index][0].factor} "
+                                f"(exitcode={process.exitcode})"
+                            ) from exc
+                        try:
+                            message = result_queue.get(timeout=remaining)
+                        except queue.Empty:
+                            process = active[failed_index]
+                            raise RuntimeError(
+                                "factor worker exited without a result: "
+                                f"{groups[failed_index][0].factor} "
+                                f"(exitcode={process.exitcode})"
+                            ) from exc
+                        if message[1] in dead:
+                            status, group_index, payload = message
+                            break
+                        deferred_messages.append(message)
+
+            process = active.pop(group_index)
+            process.join()
+            blocked_dead.discard(group_index)
+            if status != "ok":
+                raise RuntimeError(payload)
+            if process.exitcode != 0:
+                raise RuntimeError(
+                    f"factor worker exited with code {process.exitcode}: "
+                    f"{groups[group_index][0].factor}"
+                )
+            completed[group_index] = payload
+            print(
+                json.dumps(
+                    {
+                        "event": "factor_complete",
+                        "index": group_index + 1,
+                        "total": len(groups),
+                        "factor": groups[group_index][0].factor,
+                    }
+                ),
+                flush=True,
+            )
+            blocked_dead.update(
+                index for index, child in active.items() if not child.is_alive()
+            )
+            if (
+                next_group < len(groups)
+                and not blocked_dead
+                and not deferred_messages
+            ):
+                start_group(next_group)
+                next_group += 1
     finally:
+        for process in active.values():
+            if process.is_alive():
+                process.terminate()
+        for process in active.values():
+            process.join()
         result_queue.close()
-    if status != "ok":
-        raise RuntimeError(payload)
-    if process.exitcode != 0:
-        raise RuntimeError(f"isolated campaign job exited with code {process.exitcode}: {job.factor}/{job.mode}")
-    return payload
+        result_queue.join_thread()
+
+    results_by_position = {
+        position: result
+        for group_index in range(len(groups))
+        for position, result in completed[group_index]
+    }
+    return [results_by_position[index] for index in range(len(jobs))]
 
 
-def execute_campaign(jobs: list[CampaignJob], *, isolate_jobs: bool = False) -> list[dict]:
+def execute_campaign(
+    jobs: list[CampaignJob],
+    *,
+    isolate_jobs: bool = False,
+    factor_workers: int = 1,
+) -> list[dict]:
+    if not isinstance(factor_workers, int) or isinstance(factor_workers, bool):
+        raise TypeError("factor_workers must be an integer from 1 to 6")
+    if not 1 <= factor_workers <= len(FACTOR_COLUMNS):
+        raise ValueError("factor_workers must be from 1 to 6")
     preflight_targets(jobs)
     validate_campaign_input_coverage(jobs)
     validations: list[dict] = []
@@ -326,36 +540,17 @@ def execute_campaign(jobs: list[CampaignJob], *, isolate_jobs: bool = False) -> 
             )
         validations.append(validation)
 
+    if isolate_jobs or factor_workers > 1:
+        return _execute_factor_groups(
+            jobs,
+            validations,
+            factor_workers=factor_workers,
+        )
+
     results: list[dict] = []
     for index, (job, validation) in enumerate(zip(jobs, validations, strict=True), start=1):
         print(json.dumps({"event": "start", "index": index, "total": len(jobs), "factor": job.factor, "mode": job.mode}), flush=True)
-        if isolate_jobs:
-            result = _execute_job_isolated(job, validation)
-        else:
-            summary = run_from_config(
-                job.config,
-                output_root=job.output_root,
-                input_manifest={"validation": validation},
-            )
-            if not summary.get("audit", {}).get("passed"):
-                raise RuntimeError(
-                    f"audit failed for {job.factor}/{job.mode}: "
-                    f"{summary.get('audit', {}).get('errors', [])}"
-                )
-            report = generate_backtest_report(
-                job.output_root,
-                job.config.paths.result_view_root,
-                factor_name=job.factor,
-                mode=job.mode,
-            )
-            result = {
-                "factor": job.factor,
-                "mode": job.mode,
-                "output_root": str(job.output_root),
-                "report_root": str(job.report_root),
-                "summary": summary,
-                "report": report,
-            }
+        result = _execute_job(job, validation)
         results.append(result)
         print(json.dumps({"event": "complete", "index": index, "total": len(jobs), "factor": job.factor, "mode": job.mode}), flush=True)
     return results
@@ -382,7 +577,11 @@ def main(argv: list[str] | None = None) -> int:
         factor_path=FACTOR_PATH,
         factor_manifest_path=FACTOR_MANIFEST_PATH,
     )
-    results = execute_campaign(jobs, isolate_jobs=True)
+    results = execute_campaign(
+        jobs,
+        isolate_jobs=True,
+        factor_workers=args.factor_workers,
+    )
     print(json.dumps({"scope": args.scope, "completed": len(results), "results": results}, default=str), flush=True)
     return 0
 

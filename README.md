@@ -221,14 +221,19 @@ python -m backtrade.cli prepare-input \
   --source-manifest-path /data/team/rolling_manifest.json
 ```
 
-固定的 v2p3 rolling 六因子任务由一个脚本依次执行 12 组回测，启动前会
-统一校验输入和所有目标目录，并拒绝覆盖已有产物：
+固定的 v2p3 rolling 六因子任务由一个脚本执行 12 组回测，启动前会统一
+校验输入和所有目标目录，并拒绝覆盖已有产物。不同因子可以由独立进程并行，
+同一因子的 Maker、Taker 仍按此顺序执行；任一因子失败后不会启动尚未运行的因子：
 
 ```sh
 python scripts/run_v2p3_rolling_campaign.py --scope sample
 # 样本结果确认后才运行：
-python scripts/run_v2p3_rolling_campaign.py --scope full
+python scripts/run_v2p3_rolling_campaign.py --scope full --factor-workers 4
 ```
+
+`--factor-workers` 允许 `1` 到 `6`，默认 `1` 保持顺序执行。全量首次运行建议
+从 `4` 开始，观察共享 Parquet/NVMe 吞吐后再决定是否提高到 `6`。该并发只发生在
+不同因子之间，不拆分单个因子的有序 tick/FIFO 撮合，也不使用 GPU。
 
 同时把 YAML 的 strategy.factor_name 和 strategy.factor_column 都改为 my_ofi，
 并把下面命令中的 --factor-path 替换为 /data/team/my_ofi.parquet，再执行 validate 和 run。

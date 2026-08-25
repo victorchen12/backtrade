@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from pathlib import Path
+import multiprocessing
+import os
 import subprocess
 import sys
+import time
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -50,6 +53,32 @@ def _jobs(tmp_path: Path):
         factor_path=tmp_path / "factors.parquet",
         factor_manifest_path=tmp_path / "factor_bundle_manifest.json",
     )
+
+
+def _spawn_worker_execute_job(job, validation):
+    factor = job.factor
+    mode = job.mode
+    events_path = Path(validation["events_path"])
+    with events_path.open("a", encoding="utf-8") as stream:
+        stream.write(f"{factor}:{mode}\n")
+    if set_event := validation.get("set_event"):
+        set_event.set()
+    if wait_event := validation.get("wait_event"):
+        wait_event.wait(timeout=5)
+
+    action = validation.get("action")
+    if action == "barrier":
+        validation["barrier"].wait(timeout=10)
+    elif action == "raise":
+        raise RuntimeError("forced worker failure")
+    elif action == "wait":
+        validation["hold_event"].wait(timeout=10)
+    elif action == "hard_exit":
+        time.sleep(0.05)
+        os._exit(7)
+    elif action == "delay":
+        time.sleep(0.7)
+    return {"factor": factor, "mode": mode}
 
 
 def test_campaign_builds_six_factor_by_two_mode_jobs_without_yaml_duplication(tmp_path: Path) -> None:
@@ -146,6 +175,176 @@ def test_campaign_parser_requires_explicit_sample_or_full_scope() -> None:
     assert parser.parse_args(["--scope", "full"]).scope == "full"
     with pytest.raises(SystemExit):
         parser.parse_args([])
+
+
+def test_campaign_parser_validates_factor_worker_count() -> None:
+    campaign = _campaign_module()
+    parser = campaign.build_parser()
+
+    assert parser.parse_args(["--scope", "full"]).factor_workers == 1
+    assert parser.parse_args(["--scope", "full", "--factor-workers", "4"]).factor_workers == 4
+    for value in ("0", "7", "not-an-int"):
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--scope", "full", "--factor-workers", value])
+
+
+@pytest.mark.parametrize(
+    ("value", "error_type"),
+    [(0, ValueError), (7, ValueError), (True, TypeError), (1.5, TypeError)],
+)
+def test_campaign_execute_rejects_invalid_factor_worker_count(
+    value,
+    error_type,
+    monkeypatch,
+) -> None:
+    campaign = _campaign_module()
+    monkeypatch.setattr(campaign, "validate_campaign_input_coverage", lambda jobs: set())
+
+    with pytest.raises(error_type, match="factor_workers"):
+        campaign.execute_campaign([], factor_workers=value)
+
+
+def test_campaign_groups_maker_and_taker_jobs_by_factor(tmp_path: Path) -> None:
+    campaign = _campaign_module()
+
+    groups = campaign.group_jobs_by_factor(_jobs(tmp_path))
+
+    assert len(groups) == len(campaign.FACTOR_COLUMNS)
+    assert [
+        (group[0].factor, [job.mode for job in group])
+        for group in groups
+    ] == [
+        (factor, ["maker", "taker"])
+        for factor in campaign.FACTOR_COLUMNS
+    ]
+
+
+def test_campaign_rejects_incomplete_or_reordered_factor_group(tmp_path: Path) -> None:
+    campaign = _campaign_module()
+    jobs = _jobs(tmp_path)
+
+    for invalid_group in ([jobs[0]], [jobs[1], jobs[0]]):
+        with pytest.raises(ValueError, match="maker.*taker"):
+            campaign.group_jobs_by_factor(invalid_group)
+
+
+def test_campaign_factor_workers_use_spawn_context() -> None:
+    campaign = _campaign_module()
+
+    assert campaign._factor_worker_context().get_start_method() == "spawn"
+
+
+def test_campaign_runs_factor_groups_concurrently_and_keeps_modes_ordered(
+    tmp_path: Path,
+) -> None:
+    campaign = _campaign_module()
+    jobs = _jobs(tmp_path)[:4]
+    context = multiprocessing.get_context("spawn")
+    maker_barrier = context.Barrier(2)
+    events_path = tmp_path / "events.txt"
+    validations = [
+        {
+            "events_path": str(events_path),
+            "action": "barrier" if job.mode == "maker" else None,
+            "barrier": maker_barrier,
+        }
+        for job in jobs
+    ]
+
+    results = campaign._execute_factor_groups(
+        jobs,
+        validations,
+        factor_workers=2,
+        execute_job=_spawn_worker_execute_job,
+    )
+
+    assert [(result["factor"], result["mode"]) for result in results] == [
+        (job.factor, job.mode) for job in jobs
+    ]
+    events = [
+        line.strip().split(":")
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    for factor in campaign.FACTOR_COLUMNS[:2]:
+        assert [mode for event_factor, mode in events if event_factor == factor] == [
+            "maker",
+            "taker",
+        ]
+
+
+def test_campaign_stops_pending_factor_groups_after_worker_failure(
+    tmp_path: Path,
+) -> None:
+    campaign = _campaign_module()
+    jobs = _jobs(tmp_path)[:6]
+    first_factor, second_factor, pending_factor = campaign.FACTOR_COLUMNS[:3]
+    context = multiprocessing.get_context("spawn")
+    second_started = context.Event()
+    hold_second_worker = context.Event()
+    events_path = tmp_path / "failure-events.txt"
+    validations = []
+    for job in jobs:
+        validation = {"events_path": str(events_path)}
+        if job.factor == first_factor and job.mode == "maker":
+            validation.update({"action": "raise", "wait_event": second_started})
+        elif job.factor == second_factor and job.mode == "maker":
+            validation.update(
+                {
+                    "action": "wait",
+                    "set_event": second_started,
+                    "hold_event": hold_second_worker,
+                }
+            )
+        validations.append(validation)
+
+    with pytest.raises(RuntimeError, match="forced worker failure"):
+        campaign._execute_factor_groups(
+            jobs,
+            validations,
+            factor_workers=2,
+            execute_job=_spawn_worker_execute_job,
+        )
+
+    events = events_path.read_text(encoding="utf-8").splitlines()
+    assert any(line.startswith(f"{first_factor}:") for line in events)
+    assert any(line.startswith(f"{second_factor}:") for line in events)
+    assert not any(line.startswith(f"{pending_factor}:") for line in events)
+
+
+def test_campaign_does_not_start_pending_group_after_hard_worker_exit(
+    tmp_path: Path,
+) -> None:
+    campaign = _campaign_module()
+    jobs = _jobs(tmp_path)[:6]
+    first_factor, second_factor, pending_factor = campaign.FACTOR_COLUMNS[:3]
+    context = multiprocessing.get_context("spawn")
+    second_started = context.Event()
+    events_path = tmp_path / "hard-exit-events.txt"
+    validations = []
+    for job in jobs:
+        validation = {"events_path": str(events_path)}
+        if job.factor == first_factor and job.mode == "maker":
+            validation.update(
+                {"action": "hard_exit", "wait_event": second_started}
+            )
+        elif job.factor == second_factor and job.mode == "maker":
+            validation.update(
+                {"action": "delay", "set_event": second_started}
+            )
+        validations.append(validation)
+
+    with pytest.raises(RuntimeError, match=f"exited without a result: {first_factor}"):
+        campaign._execute_factor_groups(
+            jobs,
+            validations,
+            factor_workers=2,
+            execute_job=_spawn_worker_execute_job,
+        )
+
+    events = events_path.read_text(encoding="utf-8").splitlines()
+    assert any(line.startswith(f"{first_factor}:") for line in events)
+    assert any(line.startswith(f"{second_factor}:") for line in events)
+    assert not any(line.startswith(f"{pending_factor}:") for line in events)
 
 
 def test_campaign_uses_confirmed_24_26_market_input() -> None:
