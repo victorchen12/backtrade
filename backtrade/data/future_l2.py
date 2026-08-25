@@ -449,6 +449,24 @@ def _infer_direction(last_price: float | None, bid: float, ask: float, vol_inc: 
     return None, None, None
 
 
+def _book_quantity(value, *, field: str) -> int:
+    """Convert a book quantity while preserving invalid-row semantics.
+
+    Upstream quality flags mark missing quantities as anomalous.  A zero keeps
+    the typed MarketTick usable for replay; matchers still reject/freeze the
+    row through is_anomaly.
+    """
+
+    if value is None or pd.isna(value):
+        return 0
+    numeric = float(value)
+    if not np.isfinite(numeric):
+        return 0
+    if numeric < 0 or numeric != float(int(numeric)):
+        raise ValueError(f"{field} must be a non-negative integer quantity")
+    return int(numeric)
+
+
 def _number(row, field: str, default: float = 0.0) -> float:
     value = getattr(row, field, default)
     return float(value) if pd.notna(value) else default
@@ -462,8 +480,8 @@ def _optional_number(row, field: str) -> float | None:
 def _tick(row, source_seq: int, limit_reference: PriceLimitReference | None, previous_last_price: float | None) -> MarketTick:
     bid_prices = tuple(float(getattr(row, f"bid{i}_prc")) for i in range(1, 6))
     ask_prices = tuple(float(getattr(row, f"ask{i}_prc")) for i in range(1, 6))
-    bid_qtys = tuple(int(getattr(row, f"bid{i}_qty")) for i in range(1, 6))
-    ask_qtys = tuple(int(getattr(row, f"ask{i}_qty")) for i in range(1, 6))
+    bid_qtys = tuple(_book_quantity(getattr(row, f"bid{i}_qty"), field=f"bid{i}_qty") for i in range(1, 6))
+    ask_qtys = tuple(_book_quantity(getattr(row, f"ask{i}_qty"), field=f"ask{i}_qty") for i in range(1, 6))
     observed = float(row.last_prc) if pd.notna(row.last_prc) else None
     vol_inc = int(row.vol_inc) if pd.notna(row.vol_inc) else 0
     ambiguous = bool(_number(row, "side_ambiguous_flag", 0))

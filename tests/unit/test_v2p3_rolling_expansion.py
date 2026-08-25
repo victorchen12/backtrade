@@ -11,6 +11,7 @@ from backtrade.cli import _prepare_input, build_parser
 from backtrade.config.schema import BacktradeConfig, DataSourceConfig
 from backtrade.data.future_l2 import (
     _iter_market_frames,
+    _book_quantity,
     _validate_factor_manifest,
     iter_future_l2_ticks,
     load_factor_frame_for_split,
@@ -415,3 +416,50 @@ def test_single_split_minimal_factor_input_keeps_legacy_selection(tmp_path: Path
     cfg = _bundle_config(market_path, factor_path, bundle_manifest)
     tick = next(iter_future_l2_ticks(cfg, batch_size=1))
     assert tick.trading_day == "2025-04-15"
+
+def _replay_tick(contract: str, trading_day: str, seq: int):
+    from backtrade.simulation.events import MarketTick
+
+    return MarketTick(
+        product="ag",
+        contract=contract,
+        tick_ts=pd.Timestamp("2026-01-05 09:00:00") + pd.Timedelta(seconds=seq),
+        last_price=100.0,
+        bid_prices=(99.0, 98.0, 97.0, 96.0, 95.0),
+        bid_qtys=(5, 5, 5, 5, 5),
+        ask_prices=(101.0, 102.0, 103.0, 104.0, 105.0),
+        ask_qtys=(5, 5, 5, 5, 5),
+        trading_day=trading_day,
+        source_seq=seq,
+    )
+
+def test_replay_allows_contract_reopen_at_new_trading_day() -> None:
+    from backtrade.data.replay import MarketReplay
+
+    rows = list(MarketReplay([
+        _replay_tick("AG2408", "2026-01-05", 1),
+        _replay_tick("AG2502", "2026-01-06", 2),
+        _replay_tick("AG2408", "2026-01-07", 3),
+    ], closing_window_ms=0))
+
+    assert len(rows) == 3
+    assert rows[0][1].is_last_tick_of_contract is True
+    assert rows[1][1].is_last_tick_of_contract is True
+
+def test_replay_rejects_contract_reopen_within_one_trading_day() -> None:
+    from backtrade.data.replay import MarketReplay
+
+    with pytest.raises(ValueError, match="reopens closed contract"):
+        list(MarketReplay([
+            _replay_tick("AG2408", "2026-01-05", 1),
+            _replay_tick("AG2502", "2026-01-05", 2),
+            _replay_tick("AG2408", "2026-01-05", 3),
+        ], closing_window_ms=0))
+
+def test_book_quantity_preserves_anomaly_and_rejects_invalid_clean_values() -> None:
+    assert _book_quantity(float("nan"), field="bid1_qty") == 0
+    assert _book_quantity(None, field="ask1_qty") == 0
+    with pytest.raises(ValueError, match="non-negative integer"):
+        _book_quantity(1.5, field="bid1_qty")
+    with pytest.raises(ValueError, match="non-negative integer"):
+        _book_quantity(-1, field="ask1_qty")

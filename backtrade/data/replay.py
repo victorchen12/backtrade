@@ -71,6 +71,8 @@ class MarketReplay:
             tick = buffer[0]
             day_key = self._day_key(tick)
             if buffered_day != day_key:
+                for contracts in closed_contracts_by_product.values():
+                    contracts.clear()
                 buffered_day = day_key
                 buffered_day_count = 1
                 buffered_day_end = tick

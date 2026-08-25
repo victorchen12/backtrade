@@ -439,3 +439,41 @@ def test_full_scope_requires_exact_32_test_splits(
     assert campaign.validate_full_split_coverage(factor_path) == {
         f"{index:03d}" for index in range(32)
     }
+
+def _write_alignment_inputs(jobs, *, map_contract: str = "AG2506") -> Path:
+    factor_path = jobs[0].config.data.factor_path
+    map_path = Path(factor_path).parent / "main_contract_map.parquet"
+    market_path = jobs[0].config.data.market_path
+    pd.DataFrame(
+        {"product": ["ag"], "trading_day": ["2025-04-15"], "underlying_secu_cd": ["AG2506"]}
+    ).to_parquet(market_path, index=False)
+    pd.DataFrame(
+        {
+            "split_id": [15],
+            "part": ["test"],
+            "product": ["ag"],
+            "trading_day": ["2025-04-15"],
+            "underlying_secu_cd": ["AG2506"],
+        }
+    ).to_parquet(factor_path, index=False)
+    pd.DataFrame(
+        {"product": ["ag"], "trading_day": ["2025-04-15"], "main_secu_cd": [map_contract]}
+    ).to_parquet(map_path, index=False)
+    return map_path
+
+
+def test_campaign_main_contract_alignment_accepts_matching_stream(tmp_path: Path) -> None:
+    campaign = _campaign_module()
+    jobs = _jobs(tmp_path)
+    map_path = _write_alignment_inputs(jobs)
+
+    assert campaign.validate_main_contract_alignment(jobs, {"2025-04-15"}, map_path) is None
+
+
+def test_campaign_main_contract_alignment_rejects_wrong_rollover(tmp_path: Path) -> None:
+    campaign = _campaign_module()
+    jobs = _jobs(tmp_path)
+    map_path = _write_alignment_inputs(jobs, map_contract="AG2508")
+
+    with pytest.raises(ValueError, match="alignment failed.*AG2508"):
+        campaign.validate_main_contract_alignment(jobs, {"2025-04-15"}, map_path)

@@ -16,6 +16,7 @@ if __package__ in {None, ""} and str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import pyarrow as pa
+import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
 from backtrade.config.loader import load_config
@@ -33,6 +34,7 @@ FACTOR_PATH = Path(
 FACTOR_MANIFEST_PATH = Path(
     "/data1/cws/backtrade/v2p3_rolling_24_26/input/factor_bundle_manifest.json"
 )
+MAIN_CONTRACT_MAP_PATH = Path("/data1/cws/future_l2/m3/pre_data/main_contract_map.parquet")
 SAMPLE_OUTPUT_BASE = Path("/data1/cws/backtrade/v2p3_rolling_24_26/sample_split_015")
 SAMPLE_RESULT_BASE = Path("/home/cws/QUANT/Backtrade/result_view/_sample_split_015")
 FULL_OUTPUT_BASE = Path("/data1/cws/backtrade/v2p3_rolling_24_26/full")
@@ -210,6 +212,138 @@ def preflight_targets(jobs: list[CampaignJob]) -> None:
             if _nonempty(path):
                 raise FileExistsError(f"campaign target is not empty and cannot be overwritten: {path}")
 
+
+def _factor_filters(data: DataSourceConfig, schema: pa.Schema) -> list[tuple[str, str, object]]:
+    filters: list[tuple[str, str, object]] = [("part", "in", list(data.parts))]
+    if data.split_ids:
+        split_type = schema.field("split_id").type
+        if pa.types.is_integer(split_type):
+            values: object = [int(value) for value in data.split_ids]
+        elif pa.types.is_string(split_type) or pa.types.is_large_string(split_type):
+            values = [str(value).zfill(3) for value in data.split_ids]
+        else:
+            raise ValueError(f"campaign factor split_id type is unsupported: {split_type}")
+        filters.append(("split_id", "in", values))
+    elif data.split_id is not None:
+        split_type = schema.field("split_id").type
+        if pa.types.is_integer(split_type):
+            value: object = int(data.split_id)
+        elif pa.types.is_string(split_type) or pa.types.is_large_string(split_type):
+            value = str(data.split_id).zfill(3)
+        else:
+            raise ValueError(f"campaign factor split_id type is unsupported: {split_type}")
+        filters.append(("split_id", "=", value))
+    return filters
+
+
+def _contracts_by_day(
+    path: Path,
+    *,
+    columns: tuple[str, str, str],
+    filters: list[tuple[str, str, object]],
+    source_name: str,
+) -> dict[str, set[str]]:
+    parquet = pq.ParquetFile(path)
+    missing = sorted(set(columns) - set(parquet.schema_arrow.names))
+    if missing:
+        raise ValueError(f"{source_name} is missing columns: {missing}")
+    contracts: dict[str, set[str]] = {}
+    expression = None
+    for name, operator, value in filters:
+        condition = ds.field(name).isin(value) if operator == "in" else ds.field(name) == value
+        expression = condition if expression is None else expression & condition
+    dataset = ds.dataset(path, format="parquet")
+    batches = dataset.scanner(columns=list(columns), filter=expression, batch_size=131_072).to_batches()
+    for batch in batches:
+        days = batch.column(columns[0]).to_pylist()
+        products = batch.column(columns[1]).to_pylist()
+        values = batch.column(columns[2]).to_pylist()
+        for day, product, contract in zip(days, products, values, strict=True):
+            if day is None or product is None or contract is None:
+                raise ValueError(f"{source_name} contains null product/day/contract keys")
+            day_key = str(day)
+            product_key = str(product).strip().lower()
+            contract_key = str(contract).strip().upper()
+            if product_key != "ag":
+                raise ValueError(f"{source_name} contains unexpected product {product!r}")
+            if not contract_key:
+                raise ValueError(f"{source_name} contains an empty contract key")
+            contracts.setdefault(day_key, set()).add(contract_key)
+    return contracts
+
+
+def validate_main_contract_alignment(
+    jobs: list[CampaignJob],
+    expected_days: set[str],
+    map_path: Path = MAIN_CONTRACT_MAP_PATH,
+) -> None:
+    """Reject inputs whose selected stream disagrees with the two-day TRVO map."""
+
+    if not jobs:
+        raise ValueError("campaign has no jobs")
+    if not expected_days:
+        raise ValueError("campaign main-contract check has no trading days")
+    first = jobs[0].config.data
+    factor_path = Path(first.factor_path).resolve()
+    market_path = Path(first.market_path).resolve()
+    map_path = Path(map_path).expanduser().resolve()
+    if not map_path.is_file():
+        raise FileNotFoundError(f"main contract map is missing: {map_path}")
+
+    factor_schema = pq.ParquetFile(factor_path).schema_arrow
+    required_factor = {"part", "trading_day", "underlying_secu_cd"}
+    if first.split_id is not None or first.split_ids:
+        required_factor.add("split_id")
+    missing_factor = sorted(required_factor - set(factor_schema.names))
+    if missing_factor:
+        raise ValueError(f"campaign factor input is missing columns: {missing_factor}")
+    day_filters = [("trading_day", "in", sorted(expected_days))]
+    factor_contracts = _contracts_by_day(
+        factor_path,
+        columns=("trading_day", "product", "underlying_secu_cd"),
+        filters=[*_factor_filters(first, factor_schema), ("trading_day", "in", sorted(expected_days))],
+        source_name="campaign factor input",
+    )
+    market_contracts = _contracts_by_day(
+        market_path,
+        columns=("trading_day", "product", "underlying_secu_cd"),
+        filters=day_filters,
+        source_name="campaign market input",
+    )
+    map_contracts = _contracts_by_day(
+        map_path,
+        columns=("trading_day", "product", "main_secu_cd"),
+        filters=[("product", "=", "ag"), *day_filters],
+        source_name="main contract map",
+    )
+
+    def invalid(source: str, values: dict[str, set[str]]) -> None:
+        missing = sorted(expected_days - values.keys())
+        multiple = {day: sorted(values[day]) for day in expected_days if len(values.get(day, set())) != 1}
+        if missing or multiple:
+            raise ValueError(
+                f"{source} does not contain exactly one ag contract per selected day: "
+                f"missing={missing}, multiple={multiple}"
+            )
+
+    invalid("campaign factor input", factor_contracts)
+    invalid("campaign market input", market_contracts)
+    invalid("main contract map", map_contracts)
+    mismatches = {
+        day: {
+            "factor": next(iter(factor_contracts[day])),
+            "market": next(iter(market_contracts[day])),
+            "expected": next(iter(map_contracts[day])),
+        }
+        for day in sorted(expected_days)
+        if factor_contracts[day] != map_contracts[day] or market_contracts[day] != map_contracts[day]
+    }
+    if mismatches:
+        raise ValueError(
+            "campaign main-contract alignment failed against the daily cumulative-TRVO "
+            "map with two-consecutive-day rollover: "
+            f"{mismatches}"
+        )
 
 def validate_campaign_input_coverage(jobs: list[CampaignJob]) -> set[str]:
     if not jobs:
@@ -550,8 +684,10 @@ def execute_campaign(
         raise TypeError("factor_workers must be an integer from 1 to 6")
     if not 1 <= factor_workers <= len(FACTOR_COLUMNS):
         raise ValueError("factor_workers must be from 1 to 6")
+    selected_days = validate_campaign_input_coverage(jobs)
+    if selected_days:
+        validate_main_contract_alignment(jobs, selected_days)
     preflight_targets(jobs)
-    validate_campaign_input_coverage(jobs)
     validations: list[dict] = []
     for job in jobs:
         validation = validate_config(job.config)
