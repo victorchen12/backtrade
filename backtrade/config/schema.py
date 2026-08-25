@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Literal
@@ -12,6 +13,7 @@ FeeMode = Literal["per_lot", "rate", "bps"]
 PriceLimitMode = Literal["percent", "absolute", "none"]
 LimitReferenceMode = Literal["disabled", "prev_day_vwap_proxy", "official"]
 MatchModeName = Literal["maker", "taker"]
+SignalModeName = Literal["signed_factor", "ecdf_tail"]
 
 
 def normalize_contract_code(contract_code: str | None) -> str:
@@ -113,12 +115,19 @@ class DataSourceConfig(BaseModel):
     market_path: Path | None = None
     # [README-1] 因子表格；相邻 manifest.json 必须绑定市场文件哈希。
     factor_path: Path | None = None
+    # [README-1] 显式因子 manifest；为空时保持相邻 manifest.json 的旧契约。
+    factor_manifest_path: Path | None = None
     parts: list[str] = Field(default_factory=lambda: ["test"])
     trading_days: list[str] | None = None
     # [README-3] 只允许因果 decision_grid；相等时间才触发新因子决策。
     factor_grid_mode: Literal["decision_grid"] = "decision_grid"
     # [README-3] 完整流 EOF 作为已知日末时设为 true；有上限的抽样保持 end_of_data。
     eof_is_day_end: bool = False
+
+    @field_validator("market_path", "factor_path", "factor_manifest_path", mode="before")
+    @classmethod
+    def expand_optional_path(cls, value: str | Path | None) -> Path | None:
+        return None if value is None else Path(str(value)).expanduser()
 
     @model_validator(mode="after")
     def validate_eof_contract(self) -> "DataSourceConfig":
@@ -132,6 +141,9 @@ class StrategyConfig(BaseModel):
     # [README-4] 因子名称由用户配置；两字段必须一致，并使用安全列名。
     factor_name: str = "l1_imbalance"
     factor_column: str = "l1_imbalance"
+    signal_mode: SignalModeName = "signed_factor"
+    short_threshold: float | None = None
+    long_threshold: float | None = None
 
     @field_validator("factor_name", "factor_column")
     @classmethod
@@ -142,6 +154,15 @@ class StrategyConfig(BaseModel):
     def validate_factor_pair(self) -> "StrategyConfig":
         if self.factor_name != self.factor_column:
             raise ValueError("strategy.factor_name and factor_column must match")
+        if self.signal_mode == "ecdf_tail":
+            if self.short_threshold is None or self.long_threshold is None:
+                raise ValueError("ecdf_tail requires short_threshold and long_threshold")
+            if not math.isfinite(self.short_threshold) or not math.isfinite(self.long_threshold):
+                raise ValueError("ecdf_tail thresholds must be finite")
+            if self.short_threshold >= self.long_threshold:
+                raise ValueError("short_threshold must be less than long_threshold")
+        elif self.short_threshold is not None or self.long_threshold is not None:
+            raise ValueError("short_threshold and long_threshold are only valid for ecdf_tail")
         return self
 
 

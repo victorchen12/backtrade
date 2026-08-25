@@ -44,51 +44,57 @@ class MarketReplay:
         buffer: deque[MarketTick] = deque()
         exhausted = False
 
-        def append_next() -> None:
+        def append_next() -> MarketTick | None:
             nonlocal exhausted, observed_product
             try:
                 candidate = next(self.ticks)
             except StopIteration:
                 exhausted = True
-                return
+                return None
             product_key = candidate.product.lower()
             if observed_product is None:
                 observed_product = product_key
             if product_key != observed_product:
                 raise ValueError("compact_v9 supports a single product; interleaved products are not supported")
             buffer.append(candidate)
+            return candidate
 
         append_next()
         previous_order_key: tuple[datetime, int] | None = None
         active_contract_by_product: dict[str, str] = {}
         closed_contracts_by_product: dict[str, set[str]] = {}
+        buffered_day: object | None = None
+        buffered_day_count = 0
+        buffered_day_end: MarketTick | None = None
+        buffered_day_end_known = False
         while buffer:
             tick = buffer[0]
             day_key = self._day_key(tick)
-            while not exhausted:
-                if any(self._day_key(item) != day_key for item in buffer):
+            if buffered_day != day_key:
+                buffered_day = day_key
+                buffered_day_count = 1
+                buffered_day_end = tick
+                buffered_day_end_known = False
+            while not exhausted and not buffered_day_end_known:
+                if not self.eof_is_day_end and self.closing_window > timedelta(0) and buffer[-1].tick_ts - tick.tick_ts >= self.closing_window:
                     break
-                if self.eof_is_day_end:
-                    append_next()
-                    continue
-                if self.closing_window > timedelta(0) and buffer[-1].tick_ts - tick.tick_ts >= self.closing_window:
+                candidate = append_next()
+                if candidate is None:
+                    if self.eof_is_day_end:
+                        buffered_day_end_known = True
                     break
-                append_next()
-                if self.closing_window == timedelta(0):
+                if self._day_key(candidate) != day_key:
+                    buffered_day_end_known = True
+                    break
+                buffered_day_count += 1
+                buffered_day_end = candidate
+                if not self.eof_is_day_end and self.closing_window == timedelta(0):
                     break
 
             next_tick = buffer[1] if len(buffer) > 1 else None
-            same_day = []
-            for item in buffer:
-                if self._day_key(item) != day_key:
-                    break
-                same_day.append(item)
-            day_end_tick = same_day[-1]
-            day_end_known = (
-                (self.eof_is_day_end and exhausted and len(same_day) == len(buffer))
-                or len(same_day) < len(buffer)
-            )
-            is_last_tick_of_day = day_end_known and tick is day_end_tick
+            day_end_tick = buffered_day_end
+            day_end_known = buffered_day_end_known
+            is_last_tick_of_day = day_end_known and buffered_day_count == 1
             is_day_closing = day_end_known and tick.tick_ts >= day_end_tick.tick_ts - self.closing_window
             seconds_to_day_end = (
                 max(0.0, (day_end_tick.tick_ts - tick.tick_ts).total_seconds()) if day_end_known else None
@@ -119,6 +125,11 @@ class MarketReplay:
             ), self.match_view(tick)
             previous_order_key = order_key
             buffer.popleft()
+            buffered_day_count -= 1
+            if buffered_day_count == 0:
+                buffered_day = None
+                buffered_day_end = None
+                buffered_day_end_known = False
             if not buffer and not exhausted:
                 append_next()
 

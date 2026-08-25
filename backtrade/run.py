@@ -7,6 +7,7 @@ from typing import Any
 from backtrade.config.schema import BacktradeConfig
 from backtrade.data.future_l2 import iter_future_l2_ticks
 from backtrade.simulation.compact_v9 import audit_compact_v9
+from backtrade.simulation.compact_v9 import CompactV9ParquetOutput
 from backtrade.simulation.compact_v9_runner import CompactV9Runner
 from backtrade.runtime.manifest import payload_digest
 from backtrade.strategies.factors import validate_factor_name
@@ -52,9 +53,10 @@ def run_from_config(
 
     limit = int(max_events) if max_events is not None else cfg.data.max_ticks
     ticks = iter_future_l2_ticks(cfg, max_events=limit)
-    runner = CompactV9Runner(cfg, ticks)
+    sink = CompactV9ParquetOutput(out, maker_enabled=cfg.match.mode == "maker")
+    runner = CompactV9Runner(cfg, ticks, snapshot_sink=sink)
     result = runner.run(max_events=max_events)
-    manifest = runner.write(out)
+    manifest = runner.write(out, sink=sink)
     audit = audit_compact_v9(out, require_final_flat=True)
     summary = {
         "artifact_schema_version": "compact_v9",

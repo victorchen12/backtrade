@@ -47,7 +47,10 @@ tick_ts, <your_factor_name>
 ```
 
 `tick_ts` 必须唯一，并且必须对应市场快照中的实际 tick。
-因子文件同目录必须有 `manifest.json`。
+单因子文件默认读取同目录的 `manifest.json`。宽表可使用
+`factor_bundle_v1` manifest 声明多个因子列，并通过
+`data.factor_manifest_path` 显式指定；每次运行仍只读取
+`strategy.factor_column` 选择的一列。
 
 ### 1.3 内置 L1 因子（可选）
 
@@ -88,12 +91,14 @@ data:
   product: ag
   market_path: ./input/market.csv
   factor_path: ./input/my_ofi.csv
+  factor_manifest_path: null  # 未配置时读取 factor_path 相邻的 manifest.json
   factor_grid_mode: decision_grid
   eof_is_day_end: true
 
 strategy:
   factor_name: my_ofi
   factor_column: my_ofi
+  signal_mode: signed_factor
 
 match:
   mode: taker
@@ -121,12 +126,16 @@ match:
 
 ## 4. 策略和信号
 
-当前策略语义为 `signed_factor_v1`：
+默认策略语义为 `signed_factor_v1`：
 
 - 因子大于 0：目标持有一手多头；
 - 因子小于 0：目标持有一手空头；
 - 因子等于 0：保持当前仓位；
 - 反向信号：先平仓，再开反向仓位。
+
+`signal_mode: ecdf_tail` 使用显式尾部阈值：因子小于等于
+`short_threshold` 时目标为空头，大于等于 `long_threshold` 时目标为多头，
+中间区间目标为空仓。反向时同样先平仓，下一次决策仍在对侧尾部才开仓。
 
 策略输出目标仓位、因子值、因子源时间和因子延迟。
 后续撮合和会计模块不重新计算信号。
@@ -198,6 +207,27 @@ python -m backtrade.cli prepare-input \
   --market-path /data/team/market.parquet \
   --factor-path /data/team/my_ofi.parquet \
   --factor-column my_ofi
+```
+
+已有含多列因子的宽表时，使用 bundle manifest，不会复制或改写因子文件：
+
+```sh
+python -m backtrade.cli prepare-input \
+  --product ag \
+  --market-path /data/team/market.parquet \
+  --factor-path /data/team/factors.parquet \
+  --factor-columns factor_a factor_b \
+  --manifest-path /data/team/factor_bundle_manifest.json \
+  --source-manifest-path /data/team/rolling_manifest.json
+```
+
+固定的 v2p3 rolling 六因子任务由一个脚本依次执行 12 组回测，启动前会
+统一校验输入和所有目标目录，并拒绝覆盖已有产物：
+
+```sh
+python scripts/run_v2p3_rolling_campaign.py --scope sample
+# 样本结果确认后才运行：
+python scripts/run_v2p3_rolling_campaign.py --scope full
 ```
 
 同时把 YAML 的 strategy.factor_name 和 strategy.factor_column 都改为 my_ofi，

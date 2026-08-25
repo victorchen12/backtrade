@@ -9,7 +9,7 @@ from itertools import islice
 from pathlib import Path
 from typing import Any, Iterable
 
-from backtrade.data.future_l2 import processed_market_path, selected_factor_screen_path
+from backtrade.data.future_l2 import _factor_manifest_path, processed_market_path, selected_factor_screen_path
 from backtrade.data.replay import MarketReplay
 from backtrade.order_match.maker import MakerMatcher
 from backtrade.order_match.taker import MissingL1Error, TakerMatcher
@@ -18,6 +18,7 @@ from backtrade.simulation.compact_v9 import CompactV9ParquetOutput
 from backtrade.simulation.events import BoundaryEvent, FillEvent, MatchView, MarketTick, Order, PortfolioTarget
 from backtrade.simulation.execution import ExecutionEngine, normalize_target_qty
 from backtrade.simulation.state import MatchMode, OrderSide, OrderStatus, OrderType, TimeInForce, TERMINAL_STATUSES
+from backtrade.strategies.ecdf_tail import EcdfTailStrategy
 from backtrade.strategies.signed_factor import SignedFactorStrategy
 from backtrade.strategies.factors import factor_semantics_version
 from backtrade.runtime.manifest import payload_digest
@@ -79,12 +80,21 @@ class CompactV9Result:
 
 
 class CompactV9Runner:
-    def __init__(self, cfg, ticks: Iterable[MarketTick], *, strategy=None):
+    def __init__(self, cfg, ticks: Iterable[MarketTick], *, strategy=None, snapshot_sink: CompactV9ParquetOutput | None = None):
         if cfg.match.mode not in {"maker", "taker"}:
             raise ValueError("compact_v9 requires match.mode=maker or taker")
         self.cfg = cfg
         self.ticks = iter(ticks)
-        self.strategy = strategy or SignedFactorStrategy(cfg.strategy.factor_name)
+        if strategy is not None:
+            self.strategy = strategy
+        elif cfg.strategy.signal_mode == "ecdf_tail":
+            self.strategy = EcdfTailStrategy(
+                cfg.strategy.factor_name,
+                short_threshold=cfg.strategy.short_threshold,
+                long_threshold=cfg.strategy.long_threshold,
+            )
+        else:
+            self.strategy = SignedFactorStrategy(cfg.strategy.factor_name)
         self.execution = ExecutionEngine(cfg)
         self.account = SingleLotAccount(cfg.initial_cash)
         self.matcher = MakerMatcher() if cfg.match.mode == "maker" else TakerMatcher()
@@ -106,9 +116,11 @@ class CompactV9Runner:
         self._day_start_equity: float | None = None
         self._flattened_boundaries: set[tuple[str, str, str, datetime]] = set()
         self._logged_order_rows: set[str] = set()
+        self._order_activity_rows: dict[str, dict[str, Any]] = {}
         self._logged_status_changes: set[tuple[str, int]] = set()
         self._seen_days: set[str] = set()
         self._max_events: int | None = None
+        self._snapshot_sink = snapshot_sink
 
     def _rule(self, contract: str):
         if contract in self.cfg.contracts:
@@ -169,39 +181,41 @@ class CompactV9Runner:
         *,
         allowed_statuses: set[OrderStatus] | None = None,
     ) -> None:
-        if order.order_id in self._logged_order_rows:
-            for row in reversed(self.activity_rows):
-                if row.get("record_type") == "order" and row.get("order_id") == order.order_id:
-                    row["actual_arrival_ts"] = getattr(order, "actual_arrival_ts", None)
-                    row["arrival_bid1"] = getattr(order, "arrival_bid1", None)
-                    row["arrival_ask1"] = getattr(order, "arrival_ask1", None)
-                    row["source_seq"] = getattr(order, "source_seq", None)
-                    row["session_id"] = getattr(order, "session_id", None)
-                    break
-        if order.order_id not in self._logged_order_rows:
-            self.activity_rows.append(
+        order_row = self._order_activity_rows.get(order.order_id)
+        if order_row is None:
+            order_row = {
+                "source_dataset": "order",
+                "record_type": "order",
+                "event_ts": order.created.decision_ts,
+                "order_seq": order.sequence,
+                "target_seq": order.target_seq,
+                "order_id": order.order_id,
+                "product": order.product,
+                "contract": order.contract,
+                "side": order.created.side.value,
+                "status": OrderStatus.CREATED.value,
+                "reason_code": order.created.reason_code,
+                "qty": order.created.qty,
+                "maker_taker_role": order.created.match_mode.value,
+                "submitted_limit_price": order.created.limit_price,
+                "decision_reference_price": getattr(order, "decision_reference_price", None),
+                "scheduled_arrival_ts": getattr(order, "scheduled_arrival_ts", None),
+                "actual_arrival_ts": getattr(order, "actual_arrival_ts", None),
+                "boundary_reason": getattr(order, "boundary_reason", None),
+            }
+            self.activity_rows.append(order_row)
+            self._order_activity_rows[order.order_id] = order_row
+            self._logged_order_rows.add(order.order_id)
+        else:
+            order_row.update(
                 {
-                    "source_dataset": "order",
-                    "record_type": "order",
-                    "event_ts": order.created.decision_ts,
-                    "order_seq": order.sequence,
-                    "target_seq": order.target_seq,
-                    "order_id": order.order_id,
-                    "product": order.product,
-                    "contract": order.contract,
-                    "side": order.created.side.value,
-                    "status": OrderStatus.CREATED.value,
-                    "reason_code": order.created.reason_code,
-                    "qty": order.created.qty,
-                    "maker_taker_role": order.created.match_mode.value,
-                    "submitted_limit_price": order.created.limit_price,
-                    "decision_reference_price": getattr(order, "decision_reference_price", None),
-                    "scheduled_arrival_ts": getattr(order, "scheduled_arrival_ts", None),
                     "actual_arrival_ts": getattr(order, "actual_arrival_ts", None),
-                    "boundary_reason": getattr(order, "boundary_reason", None),
+                    "arrival_bid1": getattr(order, "arrival_bid1", None),
+                    "arrival_ask1": getattr(order, "arrival_ask1", None),
+                    "source_seq": getattr(order, "source_seq", None),
+                    "session_id": getattr(order, "session_id", None),
                 }
             )
-            self._logged_order_rows.add(order.order_id)
         for index, change in enumerate(order.status_history[1:], start=1):
             key = (order.order_id, index)
             if key in self._logged_status_changes:
@@ -589,6 +603,13 @@ class CompactV9Runner:
             **{key: account_snapshot[key] for key in ("cash", "equity", "realized_pnl", "unrealized_pnl", "total_fee")},
         }
 
+    def _append_snapshot(self, tick: MarketTick, reason: str) -> None:
+        record = self._snapshot_record(tick, reason)
+        if self._snapshot_sink is None:
+            self.snapshots.append(record)
+        else:
+            self._snapshot_sink.write("snapshot", record)
+
     def run(self, *, max_events: int | None = None) -> CompactV9Result:
         if max_events is not None and int(max_events) <= 0:
             raise ValueError("max_events must be positive when provided")
@@ -673,7 +694,7 @@ class CompactV9Runner:
                         target = self.strategy.on_decision(strategy_view, current)
                         self._submit_target(target, tick, view, current, reject_open_reason=risk_reason)
             snapshot_reason = "contract_roll_flatten" if strategy_view.is_last_tick_of_contract else "day_end_flatten" if strategy_view.is_last_tick_of_day else "day_end_cancel_active_order" if boundary_start else "tick"
-            self.snapshots.append(self._snapshot_record(tick, snapshot_reason))
+            self._append_snapshot(tick, snapshot_reason)
             self._previous_tick = tick
             self._previous_view = view
         if self._previous_tick is not None and self.account.net_qty(self._previous_tick.product) != 0:
@@ -681,7 +702,7 @@ class CompactV9Runner:
             previous_view = self._previous_view or MarketReplay.match_view(previous_tick)
             self._flatten(previous_tick.product, previous_tick.contract, previous_view, "end_of_data_flatten")
             self.account.mark_to_market(previous_tick.product, previous_tick.mid)
-            self.snapshots.append(self._snapshot_record(previous_tick, "end_of_data_flatten"))
+            self._append_snapshot(previous_tick, "end_of_data_flatten")
         final_ts = self._previous_tick.tick_ts if self._previous_tick else datetime.now()
         if self._previous_tick is not None:
             self._cancel_product_orders(self._previous_tick.product, "end_of_data_cancel_active_order", final_ts, view=self._previous_view)
@@ -704,7 +725,7 @@ class CompactV9Runner:
         identities["market"] = identity(processed_market_path(self.cfg))
         factor_path = selected_factor_screen_path(self.cfg)
         identities["factor"] = identity(factor_path)
-        identities["factor_manifest"] = identity(factor_path.with_name("manifest.json"))
+        identities["factor_manifest"] = identity(_factor_manifest_path(self.cfg))
         for index, contract_file in enumerate(self.cfg.contract_files):
             identities[f"contract_file_{index}"] = identity(contract_file)
         if self.cfg.limit_reference.snapshot_path is not None:
@@ -719,6 +740,7 @@ class CompactV9Runner:
             Path(__file__).parents[1] / "simulation" / "events.py",
             Path(__file__).parents[1] / "position" / "single_lot.py",
             Path(__file__).parents[1] / "strategies" / "signed_factor.py",
+            Path(__file__).parents[1] / "strategies" / "ecdf_tail.py",
             Path(__file__).parents[1] / "strategies" / "factors.py",
             Path(__file__).parents[1] / "data" / "future_l2.py",
             Path(__file__).parents[1] / "data" / "tabular.py",
@@ -742,9 +764,11 @@ class CompactV9Runner:
         # [README-6] manifest 记录 writer 实际收到的输出目录，而不是配置默认目录。
             "engine_version": "compact_v9_core",
             "output_root": str(Path(output_root).expanduser().resolve()) if output_root is not None else None,
-            "strategy_name": "signed_factor",
+            "strategy_name": self.cfg.strategy.signal_mode,
             "factor_name": self.cfg.strategy.factor_name,
-            "factor_semantics_version": factor_semantics_version(self.cfg.strategy.factor_name),
+            "factor_semantics_version": factor_semantics_version(
+                self.cfg.strategy.factor_name, self.cfg.strategy.signal_mode
+            ),
             "match_mode": self.cfg.match.mode,
             "config": config,
             "config_digest": payload_digest(config),
@@ -772,12 +796,13 @@ class CompactV9Runner:
             "final_position_zero": all(value == 0 for value in result.final_snapshot.get("net_qty", {}).values()),
         }
 
-    def write(self, output_root) -> dict[str, Any]:
+    def write(self, output_root, *, sink: CompactV9ParquetOutput | None = None) -> dict[str, Any]:
         result = CompactV9Result(self.orders, self.fills, self.account_rows, self.snapshots, self.activity_rows, self.maker_events, self.boundary_events, self.account.snapshot())
-        sink = CompactV9ParquetOutput(output_root, maker_enabled=self.cfg.match.mode == "maker")
+        sink = sink or CompactV9ParquetOutput(output_root, maker_enabled=self.cfg.match.mode == "maker")
         sink.write_many("activity", result.activity_rows)
         sink.write_many("account", result.account_rows)
-        sink.write_many("snapshot", result.snapshots)
+        if self._snapshot_sink is None:
+            sink.write_many("snapshot", result.snapshots)
         if self.cfg.match.mode == "maker":
             sink.write_many("maker_event", result.maker_events)
         manifest = self._manifest_payload(result, output_root=output_root)

@@ -42,11 +42,16 @@ def generate_backtest_report(
     if root.exists() and any(root.iterdir()):
         raise FileExistsError(f"report directory is not empty and cannot be overwritten: {root}")
     root.mkdir(parents=True, exist_ok=True)
+    strategy_config = ((manifest.get("config") or {}).get("strategy") or {})
     metrics = compute_report_metrics(
         data["accounts"],
         data["snapshots"],
         data["activity"],
         initial_cash=float((manifest.get("config") or {}).get("initial_cash", 0.0)),
+        signal_mode=str(strategy_config.get("signal_mode") or "signed_factor"),
+        short_threshold=strategy_config.get("short_threshold"),
+        long_threshold=strategy_config.get("long_threshold"),
+        snapshot_stats=data.get("snapshot_stats"),
     )
     html = render_report_html(data, metrics)
     html_path = root / "report.html"

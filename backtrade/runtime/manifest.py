@@ -56,7 +56,9 @@ def build_run_manifest(cfg, *, run_id: str, output_root: str | Path, input_manif
         "config_digest": payload_digest(config),
         "input_manifest": _jsonable(input_manifest or {}),
         "match_mode": cfg.match.mode,
-        "factor_semantics_version": factor_semantics_version(cfg.strategy.factor_name),
+        "factor_semantics_version": factor_semantics_version(
+            cfg.strategy.factor_name, cfg.strategy.signal_mode
+        ),
     }
 
 

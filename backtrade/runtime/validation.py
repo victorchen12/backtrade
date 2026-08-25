@@ -73,7 +73,7 @@ def validate_config(cfg) -> dict[str, Any]:
         "inputs": inputs,
         "source": cfg.data.source,
         "product": cfg.data.product,
-        "strategy_mode": "signed_factor",
+        "strategy_mode": cfg.strategy.signal_mode,
         "factor_name": cfg.strategy.factor_name,
     }
 

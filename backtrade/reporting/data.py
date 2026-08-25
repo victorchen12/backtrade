@@ -4,9 +4,10 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 from backtrade.config.schema import BacktradeConfig
-from backtrade.data.future_l2 import load_future_l2_frame
+from backtrade.data.future_l2 import iter_future_l2_ticks
 from backtrade.simulation.compact_v9 import audit_compact_v9, read_compact_v9
 
 
@@ -88,6 +89,51 @@ def _map_event_timeline(events: pd.DataFrame, market: pd.DataFrame, *, event_col
     return mapped.sort_values("_event_order", kind="stable").drop(columns="_event_order")
 
 
+def _sample_market_stream(
+    config: BacktradeConfig,
+    *,
+    max_events: int | None = None,
+    max_rows: int = 80_000,
+) -> pd.DataFrame:
+    """Build a bounded plotting frame without materializing the replay market."""
+    if max_rows <= 0:
+        raise ValueError("max_rows must be positive")
+    columns = [
+        "tick_ts", "source_seq", "trading_day", "session_id", "last_prc", "mid1",
+        "last_prc_adj", "adj_factor", "vol_inc", "active_factor",
+    ]
+    rows: list[dict[str, object]] = []
+    stride = 1
+    seen = 0
+    previous_day: str | None = None
+    last_row: dict[str, object] | None = None
+    for tick in iter_future_l2_ticks(config, max_events=max_events, batch_size=100_000):
+        seen += 1
+        day = str(tick.trading_day) if tick.trading_day is not None else None
+        row = {
+            "tick_ts": tick.tick_ts,
+            "source_seq": tick.source_seq,
+            "trading_day": day,
+            "session_id": tick.session_id,
+            "last_prc": tick.last_price,
+            "mid1": tick.mid,
+            "last_prc_adj": tick.last_price_adj,
+            "adj_factor": tick.adj_factor,
+            "vol_inc": tick.vol_inc,
+            "active_factor": tick.factors.get("active_factor"),
+        }
+        last_row = row
+        if seen == 1 or day != previous_day or (seen - 1) % stride == 0:
+            rows.append(row)
+        previous_day = day
+        if len(rows) > max_rows:
+            rows = rows[::2]
+            stride *= 2
+    if last_row is not None and (not rows or rows[-1]["source_seq"] != last_row["source_seq"]):
+        rows.append(last_row)
+    return pd.DataFrame(rows, columns=columns)
+
+
 def _last_valid(series: pd.Series) -> float | None:
     values = pd.to_numeric(series, errors="coerce").dropna()
     return float(values.iloc[-1]) if not values.empty else None
@@ -141,12 +187,15 @@ def load_report_data(run_root: str | Path) -> dict:
         raise ValueError(f"cannot report an unaudited compact_v9 run: {audit.get('errors', [])}")
     activity = pd.read_parquet(root / "activity_ledger.parquet")
     accounts = pd.read_parquet(root / "account_ledger.parquet")
-    snapshots = pd.read_parquet(root / "state_snapshots.parquet")
-    maker_events = pd.read_parquet(root / "maker_events.parquet") if manifest.get("match_mode") == "maker" else pd.DataFrame()
     config = BacktradeConfig.model_validate(manifest["config"])
+    snapshots, snapshot_stats = _sample_snapshots_and_stats(
+        root / "state_snapshots.parquet",
+        initial_cash=float(manifest["config"].get("initial_cash", 0.0)),
+    )
+    maker_events = pd.read_parquet(root / "maker_events.parquet") if manifest.get("match_mode") == "maker" else pd.DataFrame()
     runtime = manifest.get("runtime", {})
     max_events = runtime.get("max_events") or runtime.get("max_ticks")
-    market = _attach_trading_timeline(load_future_l2_frame(config, max_events=int(max_events) if max_events else None))
+    market = _attach_trading_timeline(_sample_market_stream(config, max_events=int(max_events) if max_events else None))
     activity = _map_event_timeline(activity, market)
     accounts = _map_event_timeline(accounts, market)
     snapshots = _map_event_timeline(snapshots, market)
@@ -163,7 +212,69 @@ def load_report_data(run_root: str | Path) -> dict:
         "price_basis": market.attrs.get("price_basis", "raw"),
         "hourly_market": _hourly_market(market),
         "hourly_drawdown": _hourly_drawdown(snapshots),
+        "snapshot_stats": snapshot_stats,
     }
 
 
 __all__ = ["load_report_data"]
+def _sample_snapshots_and_stats(
+    path: Path,
+    *,
+    initial_cash: float,
+    max_rows: int = 80_000,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    columns = pq.ParquetFile(path).schema_arrow.names
+    sampled: list[dict[str, object]] = []
+    stride = 1
+    seen = 0
+    last_row: dict[str, object] | None = None
+    running_peak: float | None = None
+    peak_ts: pd.Timestamp | None = None
+    max_drawdown = 0.0
+    drawdown_peak: pd.Timestamp | None = None
+    drawdown_trough: pd.Timestamp | None = None
+    final_position: int | None = None
+    daily_last: dict[pd.Timestamp, float] = {}
+    parquet = pq.ParquetFile(path)
+    for batch in parquet.iter_batches(batch_size=65_536):
+        frame = batch.to_pandas()
+        for row in frame.itertuples(index=False):
+            payload = row._asdict()
+            seen += 1
+            last_row = payload
+            if seen == 1 or (seen - 1) % stride == 0:
+                sampled.append(payload)
+            if len(sampled) > max_rows:
+                sampled = sampled[::2]
+                stride *= 2
+            ts = pd.Timestamp(payload["event_ts"])
+            equity = float(payload["equity"])
+            final_position = int(payload["position_qty"]) if payload["position_qty"] is not None else None
+            daily_last[ts.normalize()] = equity
+            if running_peak is None or equity > running_peak:
+                running_peak = equity
+                peak_ts = ts
+            drawdown = equity - float(running_peak)
+            if drawdown < max_drawdown:
+                max_drawdown = drawdown
+                drawdown_peak = peak_ts
+                drawdown_trough = ts
+    if last_row is not None and (not sampled or sampled[-1].get("snapshot_seq") != last_row.get("snapshot_seq")):
+        sampled.append(last_row)
+    daily_values = [daily_last[key] for key in sorted(daily_last)]
+    daily_returns = []
+    if daily_values:
+        daily_returns.append(daily_values[0] / initial_cash - 1.0 if initial_cash else 0.0)
+        daily_returns.extend(
+            (current / previous - 1.0) if previous else 0.0
+            for previous, current in zip(daily_values, daily_values[1:])
+        )
+    stats = {
+        "max_drawdown": max_drawdown,
+        "max_drawdown_duration_seconds": int((drawdown_trough - drawdown_peak).total_seconds()) if drawdown_peak and drawdown_trough else 0,
+        "drawdown_peak_ts": str(drawdown_peak) if drawdown_peak is not None else None,
+        "drawdown_trough_ts": str(drawdown_trough) if drawdown_trough is not None else None,
+        "daily_returns": daily_returns,
+        "final_position_flat": seen == 0 or final_position == 0,
+    }
+    return pd.DataFrame(sampled, columns=columns), stats

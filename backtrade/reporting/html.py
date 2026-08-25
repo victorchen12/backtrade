@@ -116,6 +116,8 @@ def _build_figures(data: dict, metrics: dict) -> list[str]:
     price_label = "\u524d\u590d\u6743" if price_basis == "front_adjusted" else "\u539f\u59cb"
     manifest = data.get("manifest") or {}
     factor_name = str(manifest.get("factor_name") or "\u56e0\u5b50")
+    strategy_config = ((manifest.get("config") or {}).get("strategy") or {})
+    signal_mode = str(strategy_config.get("signal_mode") or "signed_factor")
     figures: list[str] = []
 
     if not snapshots.empty:
@@ -175,12 +177,18 @@ def _build_figures(data: dict, metrics: dict) -> list[str]:
             if len(raw_factor) > 80_000:
                 raw_factor = raw_factor.iloc[::int(np.ceil(len(raw_factor) / 80_000))]
             factor_price.add_trace(go.Scatter(x=raw_factor["plot_ts"], y=raw_factor["active_factor"], customdata=_actual_customdata(raw_factor), name=f"{factor_name} 因子", mode="lines", line=dict(color="#90a4ae", width=1), hovertemplate=f"实际时间=%{{customdata}}<br>{factor_name}=%{{y:.6f}}<extra></extra>"))
-            q10, q90 = raw_factor["active_factor"].quantile([0.10, 0.90]).tolist()
-            factor_price.add_hline(y=float(q10), line_dash="dot", line_color="#1976d2", annotation_text="q10", annotation_position="top left")
-            factor_price.add_hline(y=float(q90), line_dash="dot", line_color="#ef6c00", annotation_text="q90", annotation_position="bottom left")
-        if "factor_q10" in hourly_market:
+            if signal_mode == "ecdf_tail":
+                short_threshold = float(strategy_config["short_threshold"])
+                long_threshold = float(strategy_config["long_threshold"])
+                factor_price.add_hline(y=short_threshold, line_dash="dot", line_color="#1976d2", annotation_text="short threshold", annotation_position="top left")
+                factor_price.add_hline(y=long_threshold, line_dash="dot", line_color="#ef6c00", annotation_text="long threshold", annotation_position="bottom left")
+            else:
+                q10, q90 = raw_factor["active_factor"].quantile([0.10, 0.90]).tolist()
+                factor_price.add_hline(y=float(q10), line_dash="dot", line_color="#1976d2", annotation_text="q10", annotation_position="top left")
+                factor_price.add_hline(y=float(q90), line_dash="dot", line_color="#ef6c00", annotation_text="q90", annotation_position="bottom left")
+        if signal_mode != "ecdf_tail" and "factor_q10" in hourly_market:
             factor_price.add_trace(go.Scatter(x=hourly_market["event_ts"], y=hourly_market["factor_q10"], customdata=_actual_customdata(hourly_market), name=f"{factor_name} q10（小时）", mode="lines", line=dict(color="#1976d2"), hovertemplate="实际时间=%{customdata}<br>q10=%{y:.6f}<extra></extra>"))
-        if "factor_q90" in hourly_market:
+        if signal_mode != "ecdf_tail" and "factor_q90" in hourly_market:
             factor_price.add_trace(go.Scatter(x=hourly_market["event_ts"], y=hourly_market["factor_q90"], customdata=_actual_customdata(hourly_market), name=f"{factor_name} q90（小时）", mode="lines", line=dict(color="#ef6c00"), hovertemplate="实际时间=%{customdata}<br>q90=%{y:.6f}<extra></extra>"))
         if not market.empty and {"plot_ts", "actual_ts", "front_adjusted_price"}.issubset(market.columns):
             raw_price = market[["plot_ts", "actual_ts", "front_adjusted_price"]].dropna().sort_values("plot_ts")

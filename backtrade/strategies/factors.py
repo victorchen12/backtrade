@@ -5,6 +5,10 @@ import re
 
 L1_IMBALANCE_NAME = "l1_imbalance"
 SIGNED_FACTOR_SEMANTICS_VERSION = "signed_factor_v1"
+ECDF_TAIL_SEMANTICS_VERSION = "ecdf_tail_v1"
+SUPPORTED_FACTOR_SEMANTICS = frozenset(
+    {SIGNED_FACTOR_SEMANTICS_VERSION, ECDF_TAIL_SEMANTICS_VERSION}
+)
 FACTOR_SEMANTICS = {
     L1_IMBALANCE_NAME: SIGNED_FACTOR_SEMANTICS_VERSION,
 }
@@ -41,8 +45,12 @@ def validate_factor_name(factor_name: str) -> str:
     return factor_name
 
 
-def factor_semantics_version(factor_name: str) -> str:
+def factor_semantics_version(factor_name: str, signal_mode: str = "signed_factor") -> str:
     factor_name = validate_factor_name(factor_name)
+    if signal_mode == "ecdf_tail":
+        return ECDF_TAIL_SEMANTICS_VERSION
+    if signal_mode != "signed_factor":
+        raise ValueError(f"unsupported signal mode: {signal_mode}")
     return FACTOR_SEMANTICS.get(factor_name, SIGNED_FACTOR_SEMANTICS_VERSION)
 
 
@@ -59,8 +67,10 @@ def compute_l1_imbalance(bid1_qty: float, ask1_qty: float) -> float:
 
 __all__ = [
     "FACTOR_SEMANTICS",
+    "ECDF_TAIL_SEMANTICS_VERSION",
     "L1_IMBALANCE_NAME",
     "SIGNED_FACTOR_SEMANTICS_VERSION",
+    "SUPPORTED_FACTOR_SEMANTICS",
     "compute_l1_imbalance",
     "factor_semantics_version",
     "validate_factor_name",

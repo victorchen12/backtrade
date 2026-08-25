@@ -7,6 +7,7 @@ from typing import Iterator
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 from backtrade.config.schema import BacktradeConfig
@@ -162,6 +163,8 @@ def merge_market_and_factors(market: pd.DataFrame, factors: pd.DataFrame, *, fac
 
 
 def _factor_manifest_path(cfg: BacktradeConfig) -> Path:
+    if cfg.data.factor_manifest_path is not None:
+        return Path(cfg.data.factor_manifest_path)
     return selected_factor_screen_path(cfg).with_name("manifest.json")
 
 
@@ -183,18 +186,32 @@ def _validate_factor_manifest(cfg: BacktradeConfig, factor_path: Path) -> dict:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"canonical factor manifest cannot be read: {manifest_path}") from exc
-    allowed_versions = {f"{factor_name}_v1", f"{factor_name}_minimal_v1"}
-    if manifest.get("schema_version") not in allowed_versions:
-        raise ValueError(f"{factor_name} factor manifest version is invalid")
-    if manifest.get("factor_columns") != [factor_name]:
-        raise ValueError(f"factor manifest must expose only {factor_name}")
+    schema_version = manifest.get("schema_version")
+    is_bundle = schema_version == "factor_bundle_v1"
+    factor_columns = manifest.get("factor_columns")
+    if is_bundle:
+        if not isinstance(factor_columns, list) or factor_name not in factor_columns:
+            raise ValueError(f"factor bundle manifest does not expose {factor_name}")
+        if len(factor_columns) != len(set(factor_columns)):
+            raise ValueError("factor bundle manifest contains duplicate factor columns")
+    else:
+        allowed_versions = {f"{factor_name}_v1", f"{factor_name}_minimal_v1"}
+        if schema_version not in allowed_versions:
+            raise ValueError(f"{factor_name} factor manifest version is invalid")
+        if factor_columns != [factor_name]:
+            raise ValueError(f"factor manifest must expose only {factor_name}")
     expected_hash = manifest.get("factor_values_sha256")
     if not isinstance(expected_hash, str) or _sha256(factor_path) != expected_hash:
         raise ValueError("canonical factor input hash does not match adjacent manifest")
     declared_path = manifest.get("factor_values_keyed_path") or manifest.get("factor_values_path")
-    if declared_path and Path(declared_path).name != factor_path.name:
+    if is_bundle:
+        if not isinstance(declared_path, str) or Path(declared_path).expanduser().resolve() != factor_path.expanduser().resolve():
+            raise ValueError("factor bundle manifest points to a different factor input path")
+    elif declared_path and Path(declared_path).name != factor_path.name:
         raise ValueError("canonical factor manifest points to a different input")
     declared_product = manifest.get("product")
+    if is_bundle and declared_product is None:
+        raise ValueError("factor bundle manifest product is missing")
     if declared_product is not None and str(declared_product).lower() != str(cfg.data.product).lower():
         raise ValueError("canonical factor manifest product does not match configured product")
     market_path = processed_market_path(cfg).expanduser().resolve()
@@ -202,12 +219,35 @@ def _validate_factor_manifest(cfg: BacktradeConfig, factor_path: Path) -> dict:
         raise FileNotFoundError(f"configured market input is missing: {market_path}")
     declared_market = manifest.get("market_path")
     declared_market_hash = manifest.get("market_sha256")
+    if is_bundle:
+        if not isinstance(declared_market, str) or Path(declared_market).expanduser().resolve() != market_path:
+            raise ValueError("factor bundle manifest market path does not match configured market")
+        if not isinstance(declared_market_hash, str) or len(declared_market_hash) != 64:
+            raise ValueError("factor bundle manifest market hash is invalid")
+        if _sha256(market_path) != declared_market_hash:
+            raise ValueError("factor bundle manifest market hash does not match configured market")
+        source_path_value = manifest.get("source_manifest_path")
+        source_hash = manifest.get("source_manifest_sha256")
+        if not isinstance(source_path_value, str) or not isinstance(source_hash, str) or len(source_hash) != 64:
+            raise ValueError("factor bundle source manifest binding is invalid")
+        source_path = Path(source_path_value).expanduser().resolve()
+        if not source_path.is_file() or _sha256(source_path) != source_hash:
+            raise ValueError("factor bundle source manifest hash does not match")
+        try:
+            source_manifest = json.loads(source_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"factor bundle source manifest cannot be read: {source_path}") from exc
+        if source_manifest.get("calibrated_factor_file_sha256") != expected_hash:
+            raise ValueError("factor bundle source manifest factor hash does not match")
+        if source_manifest.get("factor_columns") != factor_columns:
+            raise ValueError("factor bundle source manifest factor columns do not match")
+        return manifest
     if declared_market_hash is not None:
         if not isinstance(declared_market_hash, str) or len(declared_market_hash) != 64:
             raise ValueError("canonical factor manifest market hash is invalid")
         if _sha256(market_path) != declared_market_hash:
             raise ValueError("canonical factor manifest market hash does not match configured market")
-    elif manifest.get("schema_version") == f"{factor_name}_minimal_v1":
+    elif schema_version == f"{factor_name}_minimal_v1":
         raise ValueError("canonical factor manifest market hash is required for minimal inputs")
     elif declared_market:
         declared_market_path = Path(str(declared_market)).expanduser().resolve()
@@ -234,7 +274,28 @@ def load_factor_frame_for_split(cfg: BacktradeConfig, nrows: int | None = None) 
     if partial_context and not has_context:
         raise ValueError("factor context columns must be complete JOIN_KEYS or omitted")
     columns = [column for column in ["part", "split_id", *JOIN_KEYS, "active_factor", factor_name, "factor_decision", "factor_source_ts", "factor_age_ms"] if column in names]
-    frame = read_table(path, columns=columns)
+    filters: list[tuple[str, str, object]] = []
+    if table_format(path) == "parquet":
+        schema = pq.ParquetFile(path).schema_arrow
+        if cfg.data.parts and "part" in names:
+            part_type = schema.field("part").type
+            part_values = [str(value) for value in cfg.data.parts] if pa.types.is_string(part_type) or pa.types.is_large_string(part_type) else list(cfg.data.parts)
+            filters.append(("part", "in", part_values))
+        if cfg.data.split_id is not None and "split_id" in names:
+            split_type = schema.field("split_id").type
+            if pa.types.is_integer(split_type):
+                split_value: object = int(cfg.data.split_id)
+            elif pa.types.is_string(split_type) or pa.types.is_large_string(split_type):
+                split_value = str(cfg.data.split_id).zfill(3)
+            else:
+                raise ValueError(f"factor split_id type is unsupported: {split_type}")
+            filters.append(("split_id", "=", split_value))
+        if cfg.data.trading_days and "trading_day" in names:
+            filters.append(("trading_day", "in", [str(value) for value in cfg.data.trading_days]))
+    if table_format(path) == "parquet":
+        frame = pq.read_table(path, columns=columns, filters=filters or None).to_pandas()
+    else:
+        frame = read_table(path, columns=columns)
     if cfg.data.parts and "part" in frame:
         frame = frame[frame["part"].astype(str).isin({str(value) for value in cfg.data.parts})]
     if cfg.data.split_id is not None and "split_id" in frame:
@@ -317,6 +378,66 @@ def _read_market(path: Path, days: set[str], *, product: str, tick_size: float) 
     return derive_market_quality_flags(out, tick_size=tick_size)
 
 
+def _iter_market_frames(
+    path: Path,
+    days: set[str],
+    *,
+    product: str,
+    tick_size: float,
+    batch_size: int,
+) -> Iterator[pd.DataFrame]:
+    """Yield bounded market batches while preserving the source sequence."""
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    table_kind = table_format(path)
+    names = set(table_columns(path))
+    missing = sorted(set(MARKET_COLUMNS) - names)
+    if missing:
+        raise KeyError(f"market input is missing columns: {missing}")
+    columns = [column for column in [*MARKET_COLUMNS, *MARKET_OPTIONAL_COLUMNS] if column in names]
+    if table_kind != "parquet":
+        frame = _read_market(path, days, product=product, tick_size=tick_size)
+        for start in range(0, len(frame), batch_size):
+            yield frame.iloc[start : start + batch_size].copy()
+        return
+
+    parquet = pq.ParquetFile(path)
+    selected = set(_row_groups_for_days(parquet, days))
+    source_offset = 0
+    for group in range(parquet.num_row_groups):
+        row_count = parquet.metadata.row_group(group).num_rows
+        if group not in selected:
+            source_offset += row_count
+            continue
+        batch_offset = 0
+        for record_batch in parquet.iter_batches(
+            batch_size=batch_size,
+            row_groups=[group],
+            columns=columns,
+        ):
+            frame = record_batch.to_pandas()
+            size = len(frame)
+            frame["source_seq"] = np.arange(
+                source_offset + batch_offset,
+                source_offset + batch_offset + size,
+                dtype="int64",
+            )
+            batch_offset += size
+            if days:
+                frame = frame[frame["trading_day"].astype(str).isin(days)]
+            if frame.empty:
+                continue
+            if "product" not in frame:
+                frame["product"] = str(product).lower()
+            else:
+                frame["product"] = frame["product"].fillna(product).astype(str).str.lower()
+            if (frame["product"] != str(product).lower()).any():
+                raise ValueError("market product does not match configured product")
+            frame = _clean_keys(frame)
+            yield derive_market_quality_flags(frame, tick_size=tick_size)
+        source_offset += row_count
+
+
 def _infer_direction(last_price: float | None, bid: float, ask: float, vol_inc: int, ambiguous: bool, stale: bool, anomaly: bool) -> tuple[OrderSide | None, str | None, str | None]:
     if last_price is None or vol_inc <= 0 or ambiguous or stale or anomaly:
         return None, None, None
@@ -330,6 +451,11 @@ def _infer_direction(last_price: float | None, bid: float, ask: float, vol_inc: 
 def _number(row, field: str, default: float = 0.0) -> float:
     value = getattr(row, field, default)
     return float(value) if pd.notna(value) else default
+
+
+def _optional_number(row, field: str) -> float | None:
+    value = getattr(row, field, None)
+    return float(value) if value is not None and pd.notna(value) else None
 
 
 def _tick(row, source_seq: int, limit_reference: PriceLimitReference | None, previous_last_price: float | None) -> MarketTick:
@@ -363,6 +489,7 @@ def _tick(row, source_seq: int, limit_reference: PriceLimitReference | None, pre
         is_anomaly=anomaly, is_stale=stale, trade_direction=direction, trade_direction_source=source, trade_direction_confidence=confidence,
         direction_source=source, direction_confidence=confidence, trade_direction_quality=confidence, direction_quality=confidence,
         factor_decision=factor_decision, factor_source_ts=factor_source_ts, factor_age_ms=float(row.factor_age_ms) if pd.notna(row.factor_age_ms) else None,
+        last_price_adj=_optional_number(row, "last_prc_adj"), adj_factor=_optional_number(row, "adj_factor"),
     )
 
 
@@ -415,25 +542,54 @@ def iter_future_l2_ticks(cfg: BacktradeConfig, max_events: int | None = None, ba
         raise FileNotFoundError(f"market input is missing: {market_path}")
     factors = load_factor_frame_for_split(cfg)
     days = set(factors["trading_day"].astype(str)) if "trading_day" in factors else set(cfg.data.trading_days or [])
-    market = _read_market(market_path, days, product=cfg.data.product, tick_size=float(cfg.contract_rule().tick_size))
     if "trading_day" not in factors:
+        market = _read_market(market_path, days, product=cfg.data.product, tick_size=float(cfg.contract_rule().tick_size))
         factors = enrich_factor_keys(market, factors, factor_name=cfg.strategy.factor_column)
         days = set(factors["trading_day"].astype(str))
         market = market[market["trading_day"].astype(str).isin(days)].copy()
+        market_batches = (market.iloc[start : start + batch_size].copy() for start in range(0, len(market), batch_size))
+    else:
+        market_batches = _iter_market_frames(
+            market_path,
+            days,
+            product=cfg.data.product,
+            tick_size=float(cfg.contract_rule().tick_size),
+            batch_size=batch_size,
+        )
     refs = _limit_references(cfg, factors, market_path)
-    aligned = merge_market_and_factors(market, factors, factor_grid_mode="decision_grid", factor_name=cfg.strategy.factor_column)
+    factor_by_day = {
+        str(day): group
+        for day, group in factors.groupby("trading_day", sort=False)
+    } if "trading_day" in factors else {}
     previous_last: dict[tuple[str, str, str, str], float] = {}
     limit = max_events if max_events is not None else cfg.data.max_ticks
     produced = 0
-    for row in aligned.itertuples(index=False):
-        key = (str(row.product).lower(), str(row.underlying_secu_cd).upper(), str(row.session_id), str(row.trading_day))
-        tick = _tick(row, int(row.source_seq), refs.get((str(row.trading_day), str(row.underlying_secu_cd).upper())), previous_last.get(key))
-        yield tick
-        produced += 1
-        if tick.vol_inc > 0 and not tick.side_ambiguous_flag and not tick.is_stale and not tick.is_anomaly:
-            previous_last[key] = tick.last_price
-        if limit is not None and produced >= int(limit):
-            return
+    saw_market = False
+    for market in market_batches:
+        saw_market = True
+        market_days = {str(day) for day in market["trading_day"].unique()}
+        matching_factors = [factor_by_day[day] for day in market_days if day in factor_by_day]
+        if matching_factors:
+            factor_batch = matching_factors[0] if len(matching_factors) == 1 else pd.concat(matching_factors, ignore_index=True)
+        else:
+            factor_batch = factors.iloc[0:0]
+        aligned = merge_market_and_factors(
+            market,
+            factor_batch,
+            factor_grid_mode="decision_grid",
+            factor_name=cfg.strategy.factor_column,
+        )
+        for row in aligned.itertuples(index=False):
+            key = (str(row.product).lower(), str(row.underlying_secu_cd).upper(), str(row.session_id), str(row.trading_day))
+            tick = _tick(row, int(row.source_seq), refs.get((str(row.trading_day), str(row.underlying_secu_cd).upper())), previous_last.get(key))
+            yield tick
+            produced += 1
+            if tick.vol_inc > 0 and not tick.side_ambiguous_flag and not tick.is_stale and not tick.is_anomaly:
+                previous_last[key] = tick.last_price
+            if limit is not None and produced >= int(limit):
+                return
+    if not saw_market:
+        raise ValueError(f"market input has no rows for selected trading days: {sorted(days)[:5]}")
 
 
 def load_future_l2_ticks(cfg: BacktradeConfig, max_events: int | None = None) -> list[MarketTick]:

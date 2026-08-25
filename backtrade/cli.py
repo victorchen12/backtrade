@@ -50,6 +50,9 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--factor-path", help="自定义因子表格文件路径；manifest 写在同目录")
     prepare.add_argument("--product", required=True, help="商品代码")
     prepare.add_argument("--factor-column", default=L1_IMBALANCE_NAME, help="因子表格中的列名；必须与 YAML strategy.factor_column 一致")
+    prepare.add_argument("--factor-columns", nargs="+", help="宽表中的全部因子列；启用 factor_bundle_v1")
+    prepare.add_argument("--manifest-path", help="manifest 输出路径；为空时写入因子文件相邻 manifest.json")
+    prepare.add_argument("--source-manifest-path", help="bundle 对应的来源 rolling manifest")
     derive = commands.add_parser("derive-factor")
     derive.add_argument("--market-path", required=True)
     derive.add_argument("--factor-path", required=True)
@@ -110,12 +113,20 @@ def _prepare_input(
     factor_path_arg: str | None = None,
     *,
     factor_column: str = L1_IMBALANCE_NAME,
+    factor_columns: list[str] | None = None,
+    manifest_path_arg: str | None = None,
+    source_manifest_path_arg: str | None = None,
 ) -> dict[str, Any]:
     # [README-1] 输入登记只检查身份和表结构，不改写原始表格文件。
-    factor_column = validate_factor_name(factor_column)
+    bundle_mode = factor_columns is not None
+    selected_columns = [validate_factor_name(value) for value in factor_columns] if bundle_mode else [validate_factor_name(factor_column)]
+    if not selected_columns or len(selected_columns) != len(set(selected_columns)):
+        raise ValueError("factor columns must be non-empty and unique")
+    if source_manifest_path_arg is not None and not bundle_mode:
+        raise ValueError("--source-manifest-path requires --factor-columns")
     root = Path(root_arg).expanduser().resolve() if root_arg else None
     market_path = Path(market_path_arg).expanduser().resolve() if market_path_arg else resolve_table_candidate(root, "market") if root else None
-    factor_path = Path(factor_path_arg).expanduser().resolve() if factor_path_arg else resolve_table_candidate(root, factor_column) if root else None
+    factor_path = Path(factor_path_arg).expanduser().resolve() if factor_path_arg else resolve_table_candidate(root, selected_columns[0]) if root and not bundle_mode else None
     if market_path is None or factor_path is None:
         raise ValueError("prepare-input requires --root or both explicit file paths")
     if not market_path.is_file() or not factor_path.is_file():
@@ -125,41 +136,84 @@ def _prepare_input(
     if missing_market:
         raise ValueError(f"market input is missing required columns: {missing_market}")
     factor_names = set(table_columns(factor_path))
-    required_factor = {"tick_ts", factor_column}
+    required_factor = {"tick_ts", *selected_columns}
     if required_factor - factor_names:
-        raise ValueError(f"factor input requires tick_ts and {factor_column}")
-    factor_read_columns = ["tick_ts", factor_column]
+        raise ValueError(f"factor input is missing required columns: {sorted(required_factor - factor_names)}")
+    factor_read_columns = ["tick_ts", *selected_columns]
     factor_context = ["product", "trading_day", "session_id", "underlying_secu_cd"]
-    if set(factor_context).issubset(factor_names):
+    present_context = set(factor_context) & factor_names
+    if present_context and present_context != set(factor_context):
+        raise ValueError("factor input must contain complete context columns or only tick_ts")
+    if bundle_mode and present_context != set(factor_context):
+        raise ValueError("factor bundle input requires complete context columns")
+    if present_context == set(factor_context):
         factor_read_columns = [*factor_context, *factor_read_columns]
+    factor_read_columns = [column for column in ["split_id", "part", *factor_read_columns] if column in factor_names]
     factors = read_table(factor_path, columns=factor_read_columns)
     factors["tick_ts"] = pd.to_datetime(factors["tick_ts"])
-    key_columns = [*factor_context, "tick_ts"] if set(factor_context).issubset(factors.columns) else ["tick_ts"]
+    key_columns = [column for column in ["split_id", "part", *factor_context, "tick_ts"] if column in factors.columns]
     if factors["tick_ts"].isna().any() or factors.duplicated(key_columns).any():
         raise ValueError("factor input must have unique, non-null factor keys")
-    if not factors[factor_column].map(lambda value: pd.notna(value) and np.isfinite(float(value))).all():
-        raise ValueError(f"{factor_column} must contain finite values")
+    if bundle_mode and (factors["product"].astype(str).str.lower() != str(product).lower()).any():
+        raise ValueError("factor bundle product does not match configured product")
+    for column in selected_columns:
+        values = pd.to_numeric(factors[column], errors="coerce").to_numpy(dtype=float)
+        if not np.isfinite(values).all():
+            raise ValueError(f"{column} must contain finite values")
+    factor_hash = _sha256(factor_path)
+    source_manifest_path: Path | None = None
+    source_manifest_hash: str | None = None
+    source_schema_version: str | None = None
+    if bundle_mode:
+        if source_manifest_path_arg is None:
+            raise ValueError("factor bundle requires --source-manifest-path")
+        source_manifest_path = Path(source_manifest_path_arg).expanduser().resolve()
+        if not source_manifest_path.is_file():
+            raise FileNotFoundError(f"source manifest is missing: {source_manifest_path}")
+        try:
+            source_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"source manifest cannot be read: {source_manifest_path}") from exc
+        if source_manifest.get("calibrated_factor_file_sha256") != factor_hash:
+            raise ValueError("source manifest factor hash does not match factor input")
+        if source_manifest.get("factor_columns") != selected_columns:
+            raise ValueError("source manifest factor columns do not match requested bundle")
+        calibrated_columns = source_manifest.get("calibrated_factor_columns")
+        if not isinstance(calibrated_columns, list) or not set(selected_columns).issubset(calibrated_columns):
+            raise ValueError("source manifest calibrated columns do not cover requested bundle")
+        source_manifest_hash = _sha256(source_manifest_path)
+        source_schema_version = source_manifest.get("schema_version")
     manifest = {
-        "schema_version": f"{factor_column}_minimal_v1",
+        "schema_version": "factor_bundle_v1" if bundle_mode else f"{selected_columns[0]}_minimal_v1",
         "product": str(product).lower(),
         "market_path": str(market_path),
         "market_sha256": _sha256(market_path),
         "factor_values_path": str(factor_path),
-        "factor_values_sha256": _sha256(factor_path),
-        "factor_columns": [factor_column],
-        "input_columns": {"market_required": MARKET_COLUMNS, "factor_required": ["tick_ts", factor_column]},
+        "factor_values_sha256": factor_hash,
+        "factor_columns": selected_columns,
+        "input_columns": {"market_required": MARKET_COLUMNS, "factor_required": ["tick_ts", *selected_columns]},
     }
+    if bundle_mode:
+        manifest.update(
+            {
+                "source_manifest_path": str(source_manifest_path),
+                "source_manifest_sha256": source_manifest_hash,
+                "source_manifest_schema_version": source_schema_version,
+            }
+        )
     # [README-1] manifest 与因子输入同目录，并绑定两份输入哈希。
-    manifest_path = factor_path.with_name("manifest.json")
+    manifest_path = Path(manifest_path_arg).expanduser().resolve() if manifest_path_arg else factor_path.with_name("manifest.json")
     if manifest_path.exists():
         raise FileExistsError(f"input manifest already exists: {manifest_path}")
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
     return {
         "root": str(root or factor_path.parent),
         "manifest": str(manifest_path),
         "market": str(market_path),
         "factor": str(factor_path),
-        "factor_column": factor_column,
+        "factor_column": selected_columns[0],
+        "factor_columns": selected_columns,
         "market_rows": table_row_count(market_path),
         "factor_rows": int(len(factors)),
     }
@@ -214,7 +268,18 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "prepare-input":
         try:
-            _print(_prepare_input(args.root, args.product, args.market_path, args.factor_path, factor_column=args.factor_column))
+            _print(
+                _prepare_input(
+                    args.root,
+                    args.product,
+                    args.market_path,
+                    args.factor_path,
+                    factor_column=args.factor_column,
+                    factor_columns=args.factor_columns,
+                    manifest_path_arg=args.manifest_path,
+                    source_manifest_path_arg=args.source_manifest_path,
+                )
+            )
             return 0
         except Exception as exc:
             _print({"passed": False, "error": str(exc)})

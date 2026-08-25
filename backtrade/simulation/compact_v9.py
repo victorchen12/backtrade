@@ -7,7 +7,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable
 
-from backtrade.strategies.factors import FACTOR_SEMANTICS
+from backtrade.strategies.factors import (
+    ECDF_TAIL_SEMANTICS_VERSION,
+    SIGNED_FACTOR_SEMANTICS_VERSION,
+    SUPPORTED_FACTOR_SEMANTICS,
+)
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -183,10 +187,14 @@ class CompactV9ParquetOutput:
 
 
 def _read_table(root: Path, name: str, schema: pa.Schema) -> pa.Table:
-    table = pq.read_table(root / f"{name}.parquet")
-    if table.schema.names != schema.names or any(table.schema.field(i).type != schema.field(i).type for i in range(len(schema))):
+    _validate_table_schema(root, name, schema)
+    return pq.read_table(root / f"{name}.parquet")
+
+
+def _validate_table_schema(root: Path, name: str, schema: pa.Schema) -> None:
+    actual = pq.ParquetFile(root / f"{name}.parquet").schema_arrow
+    if actual.names != schema.names or any(actual.field(i).type != schema.field(i).type for i in range(len(schema))):
         raise ValueError(f"{name}: parquet schema does not match compact_v9")
-    return table
 
 
 def read_compact_v9(output_root: str | Path) -> dict[str, Any]:
@@ -252,13 +260,13 @@ def read_compact_v9(output_root: str | Path) -> dict[str, Any]:
                 digest.update(chunk)
         if not isinstance(expected_hash, str) or digest.hexdigest() != expected_hash:
             raise ValueError(f"compact_v9 input hash mismatch: {name}")
-    _read_table(root, "activity_ledger", ACTIVITY_SCHEMA)
-    _read_table(root, "account_ledger", ACCOUNT_SCHEMA)
-    _read_table(root, "state_snapshots", STATE_SCHEMA)
+    _validate_table_schema(root, "activity_ledger", ACTIVITY_SCHEMA)
+    _validate_table_schema(root, "account_ledger", ACCOUNT_SCHEMA)
+    _validate_table_schema(root, "state_snapshots", STATE_SCHEMA)
     if mode == "maker":
         if manifest.get("maker_model_version") != "mbp_prob_queue_v2_strict_through" or manifest.get("mbp_estimation") is not True or manifest.get("fifo_reconstruction") is not False:
             raise ValueError("maker compact_v9 manifest must declare strict MBP estimation and no FIFO reconstruction")
-        _read_table(root, "maker_events", MAKER_SCHEMA)
+        _validate_table_schema(root, "maker_events", MAKER_SCHEMA)
     return manifest
 
 
@@ -266,9 +274,29 @@ def _maker_fill_rows(fills: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [row for row in fills if row.get("maker_taker_role") == "maker"]
 
 
-def _audit_signal_execution(activity: list[dict[str, Any]], accounts: list[dict[str, Any]]) -> list[str]:
-    """Check signed-factor targets and ordinary fills against actual single-lot movement."""
+def _audit_signal_execution(
+    activity: list[dict[str, Any]],
+    accounts: list[dict[str, Any]],
+    *,
+    strategy_config: dict[str, Any] | None = None,
+) -> list[str]:
+    """Check configured factor targets and ordinary fills against actual single-lot movement."""
     errors: list[str] = []
+    strategy_config = strategy_config or {}
+    signal_mode = str(strategy_config.get("signal_mode") or "signed_factor")
+    expected_semantics = (
+        ECDF_TAIL_SEMANTICS_VERSION if signal_mode == "ecdf_tail" else SIGNED_FACTOR_SEMANTICS_VERSION
+    )
+    short_threshold = strategy_config.get("short_threshold")
+    long_threshold = strategy_config.get("long_threshold")
+    if signal_mode == "ecdf_tail":
+        try:
+            short_threshold = float(short_threshold)
+            long_threshold = float(long_threshold)
+        except (TypeError, ValueError):
+            return ["ecdf tail audit requires numeric short and long thresholds"]
+        if not math.isfinite(short_threshold) or not math.isfinite(long_threshold) or short_threshold >= long_threshold:
+            return ["ecdf tail audit thresholds are invalid"]
     account_by_fill = {int(row["fill_seq"]): row for row in accounts if row.get("fill_seq") is not None}
     actual_positions: dict[str, int] = {}
     latest_targets: dict[str, dict[str, Any]] = {}
@@ -288,14 +316,24 @@ def _audit_signal_execution(activity: list[dict[str, Any]], accounts: list[dict[
                 if not math.isfinite(numeric_score):
                     errors.append(f"target {row.get('target_seq')} has a non-finite factor score")
                 else:
-                    if numeric_score > 0:
-                        expected_target = 1 if current >= 0 else 0
-                    elif numeric_score < 0:
-                        expected_target = -1 if current <= 0 else 0
+                    semantics = row.get("factor_semantics_version") or expected_semantics
+                    if semantics != expected_semantics:
+                        errors.append(f"target {row.get('target_seq')} factor semantics does not match strategy config")
+                        semantics = expected_semantics
+                    if semantics == ECDF_TAIL_SEMANTICS_VERSION:
+                        desired = 1 if numeric_score >= long_threshold else -1 if numeric_score <= short_threshold else 0
+                        expected_target = 0 if current != 0 and desired != current else desired
+                        if row.get("target_qty") != expected_target:
+                            errors.append(f"target {row.get('target_seq')} violates ecdf tail semantics")
                     else:
-                        expected_target = current
-                    if row.get("target_qty") != expected_target:
-                        errors.append(f"target {row.get('target_seq')} violates signed factor semantics")
+                        if numeric_score > 0:
+                            expected_target = 1 if current >= 0 else 0
+                        elif numeric_score < 0:
+                            expected_target = -1 if current <= 0 else 0
+                        else:
+                            expected_target = current
+                        if row.get("target_qty") != expected_target:
+                            errors.append(f"target {row.get('target_seq')} violates signed factor semantics")
                 source_ts = row.get("factor_source_ts")
                 event_ts = row.get("event_ts")
                 if source_ts is None or event_ts is None or source_ts != event_ts:
@@ -327,6 +365,24 @@ def _audit_signal_execution(activity: list[dict[str, Any]], accounts: list[dict[
     return errors
 
 
+def _audit_snapshot_stream(root: Path) -> tuple[int, int | None, bool]:
+    expected_seq = 1
+    count = 0
+    final_position: int | None = None
+    sequence_valid = True
+    parquet = pq.ParquetFile(root / "state_snapshots.parquet")
+    for batch in parquet.iter_batches(columns=["snapshot_seq", "position_qty"], batch_size=65_536):
+        sequences = batch.column(0).to_pylist()
+        positions = batch.column(1).to_pylist()
+        for sequence, position in zip(sequences, positions, strict=True):
+            if sequence != expected_seq:
+                sequence_valid = False
+            expected_seq += 1
+            count += 1
+            final_position = int(position) if position is not None else None
+    return count, final_position, sequence_valid
+
+
 def audit_compact_v9(output_root: str | Path, *, require_fills: bool = False, require_final_flat: bool = False) -> dict[str, Any]:
     root = Path(output_root)
     try:
@@ -336,8 +392,8 @@ def audit_compact_v9(output_root: str | Path, *, require_fills: bool = False, re
     errors: list[str] = []
     activity = _read_table(root, "activity_ledger", ACTIVITY_SCHEMA).to_pylist()
     accounts = _read_table(root, "account_ledger", ACCOUNT_SCHEMA).to_pylist()
-    snapshots = _read_table(root, "state_snapshots", STATE_SCHEMA).to_pylist()
     maker = _read_table(root, "maker_events", MAKER_SCHEMA).to_pylist() if manifest["match_mode"] == "maker" else []
+    snapshot_count, final_snapshot_position, snapshot_sequence_valid = _audit_snapshot_stream(root)
     fills = [row for row in activity if row.get("record_type") == "fill"]
     orders = [row for row in activity if row.get("record_type") == "order"]
     targets = [row for row in activity if row.get("record_type") == "target"]
@@ -345,15 +401,16 @@ def audit_compact_v9(output_root: str | Path, *, require_fills: bool = False, re
         errors.append("activity event_seq is not monotonic")
     if [row.get("account_event_seq") for row in accounts] != list(range(1, len(accounts) + 1)):
         errors.append("account sequence is not monotonic")
-    if [row.get("snapshot_seq") for row in snapshots] != list(range(1, len(snapshots) + 1)):
+    if not snapshot_sequence_valid:
         errors.append("snapshot sequence is not monotonic")
     if maker and [row.get("maker_event_seq") for row in maker] != list(range(1, len(maker) + 1)):
         errors.append("maker event sequence is not monotonic")
-    if any(row.get("factor_semantics_version") not in {None, *FACTOR_SEMANTICS.values()} for row in targets):
+    if any(row.get("factor_semantics_version") not in {None, *SUPPORTED_FACTOR_SEMANTICS} for row in targets):
         errors.append("target factor semantics is unsupported")
     if any(row.get("target_qty") not in {None, -1, 0, 1} for row in targets):
         errors.append("target quantity is outside -1/0/+1")
-    errors.extend(_audit_signal_execution(activity, accounts))
+    strategy_config = ((manifest.get("config") or {}).get("strategy") or {})
+    errors.extend(_audit_signal_execution(activity, accounts, strategy_config=strategy_config))
     fill_seqs = [row.get("fill_seq") for row in fills]
     if len(fill_seqs) != len(set(fill_seqs)) or any(value is None for value in fill_seqs):
         errors.append("fill sequence is missing or duplicated")
@@ -432,7 +489,7 @@ def audit_compact_v9(output_root: str | Path, *, require_fills: bool = False, re
             through = trade_price is not None and price is not None and ((side == "buy" and float(trade_price) < float(price)) or (side == "sell" and float(trade_price) > float(price)))
             if row.get("data_quality") != "normal" or not (equality or through):
                 errors.append(f"maker fill lacks strict queue/trade evidence for {row.get('order_id')}")
-    final_flat = bool(snapshots) and snapshots[-1].get("position_qty") == 0
+    final_flat = snapshot_count > 0 and final_snapshot_position == 0
     if require_fills and not fills:
         errors.append("no fills present")
     if require_final_flat and not final_flat:

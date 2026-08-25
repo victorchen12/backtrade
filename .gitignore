@@ -11,4 +11,9 @@ inputs/
 *.html
 **/manifest.json
 *.log
-tests/
+tests/*
+!tests/unit/
+tests/unit/*
+!tests/unit/test_v2p3_rolling_expansion.py
+!tests/unit/test_v2p3_ecdf_tail.py
+!tests/unit/test_v2p3_campaign.py

@@ -32,7 +32,17 @@ def _max_drawdown(equity: pd.Series) -> tuple[float, int, str | None, str | None
     return float(drawdown.min()), duration, str(peak), str(trough)
 
 
-def compute_report_metrics(accounts: pd.DataFrame, snapshots: pd.DataFrame, activity: pd.DataFrame, initial_cash: float) -> dict[str, Any]:
+def compute_report_metrics(
+    accounts: pd.DataFrame,
+    snapshots: pd.DataFrame,
+    activity: pd.DataFrame,
+    initial_cash: float,
+    *,
+    signal_mode: str = "signed_factor",
+    short_threshold: float | None = None,
+    long_threshold: float | None = None,
+    snapshot_stats: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     accounts = accounts.copy()
     snapshots = snapshots.copy()
     activity = activity.copy()
@@ -50,13 +60,30 @@ def compute_report_metrics(accounts: pd.DataFrame, snapshots: pd.DataFrame, acti
     final_realized = _number(fills.iloc[-1].get("realized_pnl_after"), net_pnl + total_fee) if not fills.empty else 0.0
     final_total_fee = _number(fills.iloc[-1].get("total_fee_after"), total_fee) if not fills.empty else total_fee
     round_trips = int(((fills.get("position_before", pd.Series(dtype=float)) != 0) & (fills.get("position_after", pd.Series(dtype=float)) == 0)).sum())
-    max_dd, dd_duration, dd_peak, dd_trough = _max_drawdown(snapshots.set_index("event_ts")["equity"] if {"event_ts", "equity"}.issubset(snapshots.columns) else pd.Series(dtype=float))
+    if snapshot_stats is None:
+        max_dd, dd_duration, dd_peak, dd_trough = _max_drawdown(snapshots.set_index("event_ts")["equity"] if {"event_ts", "equity"}.issubset(snapshots.columns) else pd.Series(dtype=float))
+        daily_returns_override = None
+        final_position_flat = bool(snapshots.empty or _number(snapshots.iloc[-1].get("position_qty"), 0.0) == 0)
+    else:
+        max_dd = float(snapshot_stats.get("max_drawdown", 0.0))
+        dd_duration = int(snapshot_stats.get("max_drawdown_duration_seconds", 0))
+        dd_peak = snapshot_stats.get("drawdown_peak_ts")
+        dd_trough = snapshot_stats.get("drawdown_trough_ts")
+        daily_returns_override = pd.Series(snapshot_stats.get("daily_returns", []), dtype="float64")
+        final_position_flat = bool(snapshot_stats.get("final_position_flat", True))
 
     factor_decisions = activity[activity.get("record_type", pd.Series(index=activity.index)).eq("target")] if not activity.empty else activity
     if not factor_decisions.empty and "factor_score" in factor_decisions:
         scores = pd.to_numeric(factor_decisions["factor_score"], errors="coerce")
         decision_mask = factor_decisions.get("factor_decision", pd.Series(True, index=factor_decisions.index)).fillna(False).astype(bool)
-        active_rate = float((scores[decision_mask].fillna(0).abs() > 0).mean()) if bool(decision_mask.any()) else 0.0
+        decision_scores = scores[decision_mask]
+        if signal_mode == "ecdf_tail":
+            if short_threshold is None or long_threshold is None:
+                raise ValueError("ecdf_tail report metrics require short and long thresholds")
+            active = decision_scores.le(float(short_threshold)) | decision_scores.ge(float(long_threshold))
+        else:
+            active = decision_scores.fillna(0).abs() > 0
+        active_rate = float(active.mean()) if bool(decision_mask.any()) else 0.0
     else:
         active_rate = 0.0
 
@@ -65,7 +92,7 @@ def compute_report_metrics(accounts: pd.DataFrame, snapshots: pd.DataFrame, acti
         snap = snapshots.sort_values("event_ts").set_index("event_ts")
         daily = snap["equity"].resample("1D").last().dropna().to_frame("equity")
         daily["return"] = daily["equity"].pct_change().fillna(daily["equity"].iloc[0] / initial_cash - 1 if initial_cash else 0.0)
-    daily_returns = daily["return"] if "return" in daily else pd.Series(dtype=float)
+    daily_returns = daily_returns_override if daily_returns_override is not None else daily["return"] if "return" in daily else pd.Series(dtype=float)
     sharpe = float(np.sqrt(252.0) * daily_returns.mean() / daily_returns.std(ddof=1)) if len(daily_returns) > 1 and daily_returns.std(ddof=1) > 0 else None
     win_days = int((daily_returns > 0).sum())
     loss_days = int((daily_returns < 0).sum())
@@ -96,7 +123,7 @@ def compute_report_metrics(accounts: pd.DataFrame, snapshots: pd.DataFrame, acti
         "reconciliation": {
             "net_pnl_equals_cash_delta": bool(np.isclose(net_pnl, final_cash - initial_cash, atol=1e-6)),
             "net_pnl_equals_realized_minus_fee": bool(np.isclose(net_pnl, final_realized - final_total_fee, atol=1e-6)),
-            "final_position_flat": bool(snapshots.empty or _number(snapshots.iloc[-1].get("position_qty"), 0.0) == 0),
+            "final_position_flat": final_position_flat,
         },
     }
 

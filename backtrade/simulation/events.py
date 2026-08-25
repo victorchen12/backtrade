@@ -60,6 +60,8 @@ class MarketTick:
     factor_decision: bool = True
     factor_source_ts: datetime | None = None
     factor_age_ms: float | None = None
+    last_price_adj: float | None = None
+    adj_factor: float | None = None
 
     @property
     def bid1(self) -> float:
