@@ -467,7 +467,7 @@ def test_campaign_main_contract_alignment_accepts_matching_stream(tmp_path: Path
     jobs = _jobs(tmp_path)
     map_path = _write_alignment_inputs(jobs)
 
-    assert campaign.validate_main_contract_alignment(jobs, {"2025-04-15"}, map_path) is None
+    assert campaign.validate_main_contract_alignment(jobs, {"2025-04-15"}, map_path) == {}
 
 
 def test_campaign_main_contract_alignment_rejects_wrong_rollover(tmp_path: Path) -> None:

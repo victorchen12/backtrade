@@ -276,7 +276,9 @@ def validate_main_contract_alignment(
     jobs: list[CampaignJob],
     expected_days: set[str],
     map_path: Path = MAIN_CONTRACT_MAP_PATH,
-) -> None:
+    *,
+    allow_mismatch: bool = False,
+) -> dict[str, dict[str, str]]:
     """Reject inputs whose selected stream disagrees with the two-day TRVO map."""
 
     if not jobs:
@@ -339,11 +341,26 @@ def validate_main_contract_alignment(
         if factor_contracts[day] != map_contracts[day] or market_contracts[day] != map_contracts[day]
     }
     if mismatches:
+        if allow_mismatch:
+            print(
+                json.dumps(
+                    {
+                        "event": "main_contract_mismatch_allowed",
+                        "count": len(mismatches),
+                        "days": mismatches,
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
+            return mismatches
         raise ValueError(
             "campaign main-contract alignment failed against the daily cumulative-TRVO "
             "map with two-consecutive-day rollover: "
             f"{mismatches}"
         )
+    return {}
 
 def validate_campaign_input_coverage(jobs: list[CampaignJob]) -> set[str]:
     if not jobs:
@@ -679,6 +696,7 @@ def execute_campaign(
     *,
     isolate_jobs: bool = False,
     factor_workers: int = 1,
+    allow_main_contract_mismatch: bool = True,
 ) -> list[dict]:
     if not isinstance(factor_workers, int) or isinstance(factor_workers, bool):
         raise TypeError("factor_workers must be an integer from 1 to 6")
@@ -686,7 +704,7 @@ def execute_campaign(
         raise ValueError("factor_workers must be from 1 to 6")
     selected_days = validate_campaign_input_coverage(jobs)
     if selected_days:
-        validate_main_contract_alignment(jobs, selected_days)
+        validate_main_contract_alignment(jobs, selected_days, allow_mismatch=allow_main_contract_mismatch)
     preflight_targets(jobs)
     validations: list[dict] = []
     for job in jobs:
