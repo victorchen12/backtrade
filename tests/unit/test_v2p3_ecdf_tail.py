@@ -167,6 +167,19 @@ def test_snapshot_sink_keeps_runner_result_streaming(tmp_path) -> None:
     assert pq.ParquetFile(tmp_path / "state_snapshots.parquet").metadata.num_rows == len(ticks)
 
 
+def test_snapshot_sink_streams_activity_before_runner_finishes(tmp_path) -> None:
+    sink = CompactV9ParquetOutput(tmp_path, maker_enabled=False, batch_size=2)
+    ticks = [_tick(TS + timedelta(seconds=5 * index), index + 1, score) for index, score in enumerate([0.8, 0.8, 0.0, 0.0])]
+
+    runner = CompactV9Runner(_runner_config("taker"), ticks, snapshot_sink=sink)
+    runner.run()
+
+    assert (tmp_path / "activity_ledger.parquet").is_file()
+    assert not runner._order_activity_rows
+    assert not runner._logged_order_rows
+    sink.close()
+
+
 def test_order_activity_updates_use_order_index_instead_of_scanning_history() -> None:
     runner = CompactV9Runner(_runner_config("maker"), [])
     order = Order.create(

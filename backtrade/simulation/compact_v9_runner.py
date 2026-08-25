@@ -26,6 +26,48 @@ from backtrade.runtime.manifest import payload_digest
 
 
 
+class _CountOnly:
+    __slots__ = ("count",)
+
+    def __init__(self) -> None:
+        self.count = 0
+
+    def append(self, _record: Any) -> None:
+        self.count += 1
+
+    def extend(self, records: Iterable[Any]) -> None:
+        self.count += sum(1 for _ in records)
+
+    def __len__(self) -> int:
+        return self.count
+
+    def __iter__(self):
+        return iter(())
+
+
+class _StreamingRecordBuffer:
+    __slots__ = ("sink", "dataset", "count")
+
+    def __init__(self, sink: CompactV9ParquetOutput, dataset: str) -> None:
+        self.sink = sink
+        self.dataset = dataset
+        self.count = 0
+
+    def append(self, record: dict[str, Any]) -> None:
+        self.sink.write(self.dataset, record)
+        self.count += 1
+
+    def extend(self, records: Iterable[dict[str, Any]]) -> None:
+        for record in records:
+            self.append(record)
+
+    def __len__(self) -> int:
+        return self.count
+
+    def __iter__(self):
+        return iter(())
+
+
 def _file_identity_with_sha(path: str | Path) -> dict[str, Any]:
     resolved = Path(path).expanduser().resolve(strict=False)
     if not resolved.is_file():
@@ -98,12 +140,20 @@ class CompactV9Runner:
         self.execution = ExecutionEngine(cfg)
         self.account = SingleLotAccount(cfg.initial_cash)
         self.matcher = MakerMatcher() if cfg.match.mode == "maker" else TakerMatcher()
-        self.orders: list[Order] = []
-        self.fills: list[FillEvent] = []
-        self.account_rows: list[dict[str, Any]] = []
+        self._snapshot_sink = snapshot_sink
+        if snapshot_sink is None:
+            self.orders = []
+            self.fills = []
+            self.account_rows = []
+            self.activity_rows = []
+            self.maker_events = []
+        else:
+            self.orders = _CountOnly()
+            self.fills = _CountOnly()
+            self.account_rows = _StreamingRecordBuffer(snapshot_sink, "account")
+            self.activity_rows = _StreamingRecordBuffer(snapshot_sink, "activity")
+            self.maker_events = _StreamingRecordBuffer(snapshot_sink, "maker_event")
         self.snapshots: list[dict[str, Any]] = []
-        self.activity_rows: list[dict[str, Any]] = []
-        self.maker_events: list[dict[str, Any]] = []
         self.boundary_events: list[BoundaryEvent] = []
         self.pending_orders: list[Order] = []
         self.active_orders: list[Order] = []
@@ -120,7 +170,6 @@ class CompactV9Runner:
         self._logged_status_changes: set[tuple[str, int]] = set()
         self._seen_days: set[str] = set()
         self._max_events: int | None = None
-        self._snapshot_sink = snapshot_sink
 
     def _rule(self, contract: str):
         if contract in self.cfg.contracts:
@@ -181,6 +230,8 @@ class CompactV9Runner:
         *,
         allowed_statuses: set[OrderStatus] | None = None,
     ) -> None:
+        if self._snapshot_sink is not None and getattr(order, "_activity_streamed", False):
+            return
         order_row = self._order_activity_rows.get(order.order_id)
         if order_row is None:
             order_row = {
@@ -203,9 +254,11 @@ class CompactV9Runner:
                 "actual_arrival_ts": getattr(order, "actual_arrival_ts", None),
                 "boundary_reason": getattr(order, "boundary_reason", None),
             }
-            self.activity_rows.append(order_row)
+            if self._snapshot_sink is None:
+                self.activity_rows.append(order_row)
             self._order_activity_rows[order.order_id] = order_row
-            self._logged_order_rows.add(order.order_id)
+            if self._snapshot_sink is None:
+                self._logged_order_rows.add(order.order_id)
         else:
             order_row.update(
                 {
@@ -216,6 +269,33 @@ class CompactV9Runner:
                     "session_id": getattr(order, "session_id", None),
                 }
             )
+        if self._snapshot_sink is not None:
+            if order.status in TERMINAL_STATUSES:
+                self.activity_rows.append(order_row)
+                for change in order.status_history[1:]:
+                    self.activity_rows.append(
+                        {
+                            "source_dataset": "order_event",
+                            "record_type": "order_event",
+                            "event_ts": change.ts,
+                            "order_seq": order.sequence,
+                            "target_seq": order.target_seq,
+                            "order_id": order.order_id,
+                            "product": order.product,
+                            "contract": order.contract,
+                            "side": order.created.side.value,
+                            "status": change.to_status.value,
+                            "reason_code": change.reason_code,
+                            "arrival_bid1": getattr(order, "arrival_bid1", None),
+                            "arrival_ask1": getattr(order, "arrival_ask1", None),
+                            "scheduled_arrival_ts": getattr(order, "scheduled_arrival_ts", None),
+                            "actual_arrival_ts": getattr(order, "actual_arrival_ts", None),
+                            "boundary_reason": getattr(order, "boundary_reason", None),
+                        }
+                    )
+                setattr(order, "_activity_streamed", True)
+                self._order_activity_rows.pop(order.order_id, None)
+            return
         for index, change in enumerate(order.status_history[1:], start=1):
             key = (order.order_id, index)
             if key in self._logged_status_changes:
@@ -709,10 +789,11 @@ class CompactV9Runner:
         final = self.account.snapshot()
         if any(value != 0 for value in final.get("net_qty", {}).values()):
             raise RuntimeError(f"end_of_data_flatten failed: {final['net_qty']}")
-        for event_seq, row in enumerate(self.activity_rows, start=1):
-            row["event_seq"] = event_seq
-            if not row.get("record_type"):
-                row["record_type"] = row.get("source_dataset")
+        if self._snapshot_sink is None:
+            for event_seq, row in enumerate(self.activity_rows, start=1):
+                row["event_seq"] = event_seq
+                if not row.get("record_type"):
+                    row["record_type"] = row.get("source_dataset")
         return CompactV9Result(self.orders, self.fills, self.account_rows, self.snapshots, self.activity_rows, self.maker_events, self.boundary_events, final)
 
     def _manifest_payload(self, result: CompactV9Result, *, output_root: str | Path | None = None) -> dict[str, Any]:
@@ -799,12 +880,14 @@ class CompactV9Runner:
     def write(self, output_root, *, sink: CompactV9ParquetOutput | None = None) -> dict[str, Any]:
         result = CompactV9Result(self.orders, self.fills, self.account_rows, self.snapshots, self.activity_rows, self.maker_events, self.boundary_events, self.account.snapshot())
         sink = sink or CompactV9ParquetOutput(output_root, maker_enabled=self.cfg.match.mode == "maker")
-        sink.write_many("activity", result.activity_rows)
-        sink.write_many("account", result.account_rows)
         if self._snapshot_sink is None:
+            sink.write_many("activity", result.activity_rows)
+            sink.write_many("account", result.account_rows)
             sink.write_many("snapshot", result.snapshots)
-        if self.cfg.match.mode == "maker":
-            sink.write_many("maker_event", result.maker_events)
+            if self.cfg.match.mode == "maker":
+                sink.write_many("maker_event", result.maker_events)
+        elif sink is not self._snapshot_sink:
+            raise ValueError("streaming runner must close the same snapshot sink used during replay")
         manifest = self._manifest_payload(result, output_root=output_root)
         return sink.close(manifest=manifest)
 
